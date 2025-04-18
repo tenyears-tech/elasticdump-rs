@@ -17,7 +17,6 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::{
     fs as tokio_fs,
@@ -856,22 +855,20 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
     drop(processed_tx);
 
     // Output task
-    let writer = Arc::new(Mutex::new(writer));
     let output_task = tokio::spawn(async move {
-        let writer_ref = writer.clone();
+        let mut writer = writer;
 
         // Process output as it comes in
         while let Some(processed) = processed_rx.recv().await {
-            // Lock the writer for this batch
-            let mut writer_guard = writer_ref.lock().await;
             // Write the entire buffer from the processed batch
-            if let Err(e) = writer_guard.write_all(&processed.buffer).await {
+            if let Err(e) = writer.write_all(&processed.buffer).await {
                 return Err(anyhow!("Failed to write batch buffer: {}", e));
             }
-            // Flush the buffer after writing the batch
-            if let Err(e) = writer_guard.flush().await {
-                return Err(anyhow!("Failed to flush writer: {}", e));
-            }
+        }
+
+        // single flush after all batches are written
+        if let Err(e) = writer.flush().await {
+            return Err(anyhow!("Failed to flush writer: {}", e));
         }
         Ok(())
     });
