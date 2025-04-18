@@ -54,7 +54,7 @@ struct Cli {
     r#type: DumpType,
 
     /// Number of documents to scroll per batch
-    #[clap(long, default_value = "1000")]
+    #[clap(long, default_value = "10000")]
     limit: usize,
 
     /// Optional JSON query string or @/path/to/file.json to filter documents
