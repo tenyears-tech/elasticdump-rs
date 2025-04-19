@@ -6,7 +6,7 @@ use elasticsearch::{
     ClearScrollParts, Elasticsearch, OpenPointInTimeParts, ScrollParts, SearchParts,
     http::transport::{SingleNodeConnectionPool, TransportBuilder},
 };
-use http::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use http::header::{ACCEPT_ENCODING, AUTHORIZATION, HeaderMap, HeaderValue};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::{debug, info, warn};
 use serde_json::{Value, json};
@@ -104,6 +104,10 @@ struct Cli {
     /// Buffer size for channels
     #[clap(long("bufferSize"), default_value = "16")]
     buffer_size: usize,
+
+    /// Disable response compression (Accept-Encoding: identity)
+    #[clap(long("noCompress"))]
+    no_compress: bool,
 }
 
 // Define message types for our channels
@@ -185,16 +189,27 @@ async fn main() -> Result<()> {
     let conn_pool = SingleNodeConnectionPool::new(host_url.clone());
     let mut transport_builder = TransportBuilder::new(conn_pool);
 
+    let mut headers = HeaderMap::new();
+
     if let (Some(user), Some(pass)) = (auth_username, auth_password) {
         info!("Using basic authentication for user: {}", user);
-        let mut headers = HeaderMap::new();
         let auth_str = format!("{}:{}", user, pass);
         let auth_val = format!("Basic {}", BASE64_STANDARD.encode(auth_str));
         headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_val)?);
         debug!("Adding authorization header");
-        transport_builder = transport_builder.headers(headers);
     } else if auth_username.is_some() || auth_password.is_some() {
         warn!("Partial basic auth credentials provided (username or password missing), ignoring.");
+    }
+
+    // Add Accept-Encoding: identity if --noCompress is set
+    if args.no_compress {
+        debug!("Disabling response compression by setting Accept-Encoding: identity");
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    }
+
+    // Set headers on the builder if any were added
+    if !headers.is_empty() {
+        transport_builder = transport_builder.headers(headers);
     }
 
     debug!("Building Elasticsearch transport");
