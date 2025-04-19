@@ -105,9 +105,9 @@ struct Cli {
     #[clap(long("bufferSize"), default_value = "16")]
     buffer_size: usize,
 
-    /// Disable response compression (Accept-Encoding: identity)
-    #[clap(long("noCompress"))]
-    no_compress: bool,
+    /// Enable Elasticsearch response compression (default: disabled)
+    #[clap(long("esCompress"))]
+    es_compress: bool,
 }
 
 // Define message types for our channels
@@ -201,10 +201,12 @@ async fn main() -> Result<()> {
         warn!("Partial basic auth credentials provided (username or password missing), ignoring.");
     }
 
-    // Add Accept-Encoding: identity if --noCompress is set
-    if args.no_compress {
-        debug!("Disabling response compression by setting Accept-Encoding: identity");
+    // Add Accept-Encoding: identity by default, unless --esCompress is set
+    if !args.es_compress {
+        debug!("Disabling response compression by setting Accept-Encoding: identity (default)");
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    } else {
+        debug!("Allowing Elasticsearch response compression (--esCompress specified)");
     }
 
     // Set headers on the builder if any were added
