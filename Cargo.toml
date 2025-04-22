@@ -5,6 +5,14 @@ edition = "2024"
 description = "High-performance Elasticsearch data dumper"
 authors = ["elasticdump-rs"]
 
+[lib]
+name = "elasticdump_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "elasticdump-rs"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 elasticsearch = { version = "8.17.0-alpha.1", features = [
