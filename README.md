@@ -118,14 +118,18 @@ In performance tests on a modern machine with a local Elasticsearch instance, `e
 health status index                                 uuid                   pri rep docs.count docs.deleted store.size pri.store.size
 green  open   elasticdump_rs_test_manual_1744878888 -Y-aMCVCSjyWs4jzYQdXDg   1   0    1000100            0    132.6mb        132.6mb
 
-❯ elasticdump-rs --input=http://localhost:9200/elasticdump_rs_test_manual_1744878888 --output=$ --limit=10000 --quiet | pv -tab | wc -l
- 741MiB 0:00:02 ( 292MiB/s)
+❯ /usr/bin/time elasticdump-rs --input=http://localhost:9200/elasticdump_rs_test_manual_1744878888 --output=$ --limit=10000 --quiet | pv -tab | wc -l
+        2.54 real         0.88 user         0.59 sys
+ 741MiB 0:00:02 ( 291MiB/s)
  1000100
 
-❯ elasticdump --input=http://localhost:9200/elasticdump_rs_test_manual_1744878888 --output=$ --limit=10000 --quiet | pv -tab | wc -l
- 739MiB 0:00:11 (65.0MiB/s)
+❯ /usr/bin/time elasticdump --input=http://localhost:9200/elasticdump_rs_test_manual_1744878888 --output=$ --limit=10000 --quiet | pv -tab | wc -l
+       11.51 real         7.59 user         1.46 sys
+ 739MiB 0:00:11 (64.3MiB/s)
  1000100
 ```
+
+*We are using `0.16x` cpu time and achieve `4.5x` throughput compared to the original `elasticdump`.*
 
 *Note: The minor difference in output sizes (e.g., 741MiB vs 739MiB in the example) is due to differences in JSON serialization. `elasticdump-rs` represents floating-point numbers like `0.0` accurately, while the original Node.js `elasticdump` may represent them as integers (`0`), resulting in slightly smaller output.*
 
