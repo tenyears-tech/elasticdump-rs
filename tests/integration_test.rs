@@ -7,6 +7,7 @@ use elasticsearch::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::{HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
     process::{Command, Stdio},
@@ -1450,5 +1451,129 @@ async fn test_create_data_for_manual_testing() -> Result<()> {
     println!("=============================================\n");
 
     // Don't clean up - leave the data for manual testing
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dump_correctness() -> Result<()> {
+    // Get a unique test index and output file
+    let test_index = get_unique_test_index();
+    let output_file = format!("test_output_correctness_{}.jsonl", test_index);
+
+    // Setup test data (100 documents)
+    setup_test_data(&test_index).await?;
+
+    // Run the elasticdump-rs command for a basic dump
+    run_elasticdump_command(&[
+        "--input",
+        &format!("{}/{}", ES_URL, test_index),
+        "--output",
+        &output_file,
+        "--quiet", // Suppress progress bar in tests
+        "--limit",
+        "10",
+        "--overwrite", // Add overwrite flag
+    ])?;
+
+    // --- Verification Phase ---
+    let file = File::open(&output_file)?;
+    let reader = BufReader::new(file);
+    let mut line_count = 0;
+    let mut dumped_ids = HashSet::new();
+    let mut dumped_docs = HashMap::new();
+
+    println!("Verifying output file: {}", output_file);
+
+    // 1. Read output file, check for duplicates, store docs
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue; // Skip empty lines if any
+        }
+        let document: Value = serde_json::from_str(&line)?;
+
+        assert!(document.is_object(), "Line is not a JSON object: {}", line);
+        let doc_id = document["_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Document missing _id: {}", line))?
+            .to_string();
+        let source = document["_source"].clone();
+        assert!(!source.is_null(), "Document missing _source: {}", line);
+
+        // Check for duplicate IDs
+        if !dumped_ids.insert(doc_id.clone()) {
+            return Err(anyhow::anyhow!("Duplicate document ID found: {}", doc_id));
+        }
+
+        dumped_docs.insert(doc_id, source);
+        line_count += 1;
+    }
+
+    // 2. Verify total document count
+    assert_eq!(
+        line_count, 100,
+        "Expected 100 documents in the output file, found {}",
+        line_count
+    );
+    assert_eq!(
+        dumped_ids.len(),
+        100,
+        "Expected 100 unique document IDs, found {}",
+        dumped_ids.len()
+    );
+
+    println!("Verified {} unique documents in output file.", line_count);
+
+    // 3. Connect to Elasticsearch and verify each document's content
+    let url = Url::parse(ES_URL)?;
+    let conn_pool = SingleNodeConnectionPool::new(url.clone());
+    let transport = TransportBuilder::new(conn_pool).build()?;
+    let client = Elasticsearch::new(transport);
+
+    println!(
+        "Verifying document content against Elasticsearch index: {}",
+        test_index
+    );
+
+    // No need to create a new runtime, just await directly in the async test fn
+    for (doc_id, dumped_source) in &dumped_docs {
+        let get_response = client
+            .get(elasticsearch::GetParts::IndexId(&test_index, doc_id))
+            .send()
+            .await?;
+
+        if !get_response.status_code().is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to retrieve document {} from Elasticsearch: {:?}",
+                doc_id,
+                get_response.text().await?
+            ));
+        }
+
+        let es_doc: Value = get_response.json().await?;
+        let es_source = es_doc
+            .get("_source")
+            .ok_or_else(|| anyhow::anyhow!("Elasticsearch document {} missing _source", doc_id))?;
+
+        // Compare the source from the file with the source from ES
+        // Note: serde_json::Value comparison handles field order differences
+        if es_source != dumped_source {
+            return Err(anyhow::anyhow!(
+                "Mismatch for document ID {}:\nDumped: {}\nActual: {}",
+                doc_id,
+                serde_json::to_string_pretty(dumped_source)?,
+                serde_json::to_string_pretty(es_source)?
+            ));
+        }
+    }
+
+    println!(
+        "Successfully verified content of all {} documents.",
+        line_count
+    );
+
+    // Cleanup
+    cleanup(&test_index, &output_file).await?;
+
     Ok(())
 }
