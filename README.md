@@ -28,7 +28,7 @@ cd elasticdump-rs
 cargo build --release
 
 # Optionally, build with native optimizations
-cargo rustc --release -- -C target-cpu=native
+cargo rustc --release --bin elasticdump-rs -- -C target-cpu=native
 
 # The binary will be available at
 ./target/release/elasticdump-rs
