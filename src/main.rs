@@ -7,7 +7,7 @@ use elasticsearch::{
     http::transport::{SingleNodeConnectionPool, TransportBuilder},
 };
 use http::header::{ACCEPT_ENCODING, AUTHORIZATION, HeaderMap, HeaderValue};
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::{debug, info, warn};
 use serde_json::{Value, json};
 use std::{
@@ -134,6 +134,12 @@ async fn main() -> Result<()> {
         debug!("Debug logging enabled");
     } else {
         env_logger::init();
+    }
+
+    // Enable colors if not in quiet mode
+    if !args.quiet {
+        console::set_colors_enabled(true);
+        debug!("Console colors enabled");
     }
 
     // Parse input URL
@@ -337,14 +343,35 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
     // Shared counters for stats
     let processed_count = Arc::new(AtomicU64::new(0));
     let processed_bytes = Arc::new(AtomicU64::new(0));
+    let retrieved_count = Arc::new(AtomicU64::new(0)); // Counter for retrieved docs
+    let retrieved_bytes = Arc::new(AtomicU64::new(0)); // Counter for estimated retrieved bytes
 
-    // --- Progress Bar Setup (if not quiet and not stdout) ---
-    let progress_bar = if !args.quiet {
-        // We don't know the total hits yet, we'll update it later
-        let pb = ProgressBar::with_draw_target(Some(0), ProgressDrawTarget::stderr());
+    // --- Progress Bar Setup (if not quiet) ---
+    let multi_progress = if !args.quiet {
+        Some(MultiProgress::with_draw_target(ProgressDrawTarget::stderr()))
+    } else {
+        None
+    };
+
+    let input_bar = if let Some(mp) = &multi_progress {
+        let pb = mp.add(ProgressBar::new(0));
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({per_sec}, {msg}) {eta}")
+                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.yellow/red}]  Input: {pos}/{len} ({per_sec}, {bytes_per_sec}) {eta}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message("Waiting for total count...");
+        Some(pb)
+    } else {
+        None
+    };
+
+    let output_bar = if let Some(mp) = &multi_progress {
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.blue} [{elapsed_precise}] [{wide_bar:.cyan/blue}] Output: {pos}/{len} ({per_sec}, {bytes_per_sec}) {eta}")
                 .unwrap()
                 .progress_chars("#>-"),
         );
@@ -381,7 +408,11 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
         let mut search_body = search_body_obj.clone();
         let search_type = args.search_type.clone();
         let total_hits_count = Arc::clone(&total_hits_count);
-        let progress_bar = progress_bar.clone();
+        let input_bar = input_bar.clone(); // Clone for task
+        let output_bar = output_bar.clone(); // Clone for task
+        let retrieved_count = Arc::clone(&retrieved_count); // Clone retrieved counter
+        let retrieved_bytes = Arc::clone(&retrieved_bytes); // Clone retrieved bytes counter
+        let start_time = start_time.clone(); // Clone start time for rate calculation
 
         // Set up slice if using sliced scroll
         if use_sliced_scroll {
@@ -470,6 +501,7 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     if !search_body.contains_key("sort") {
                         search_body.insert("sort".to_string(), json!(["_id"]));
                     }
+                    debug!("Search body: {}", serde_json::to_string(&search_body).unwrap_or_default());
 
                     // Execute search with PIT ID
                     client
@@ -554,13 +586,33 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
             let new_total = previous_total + slice_total_hits;
 
             // Update progress bar length if this is the last slice to report
-            if let Some(pb) = &progress_bar {
-                pb.set_length(new_total);
-                debug!("Updated progress bar length to: {}", new_total);
+            if let (Some(ib), Some(ob)) = (&input_bar, &output_bar) {
+                ib.set_length(new_total);
+                ob.set_length(new_total);
+                debug!("Updated progress bar lengths to: {}", new_total);
             }
 
             // Process the initial batch regardless
             let response_data = Arc::new(search_response);
+            let initial_hits = response_data["hits"]["hits"]
+                .as_array()
+                .map_or(0, |h| h.len()) as u64;
+
+            // Estimate initial batch size (string length is an approximation)
+            let initial_bytes = response_data.to_string().len() as u64;
+
+            // Increment retrieved count and update input bar for initial batch
+            let current_retrieved =
+                retrieved_count.fetch_add(initial_hits, Ordering::Relaxed) + initial_hits;
+            let current_bytes_retrieved =
+                retrieved_bytes.fetch_add(initial_bytes, Ordering::Relaxed) + initial_bytes;
+            if let Some(ib) = &input_bar {
+                ib.set_position(current_retrieved);
+                let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6);
+                let bytes_per_sec = current_bytes_retrieved as f64 / elapsed_secs;
+                ib.set_message(format!("{} /s", ByteSize(bytes_per_sec as u64)));
+            }
+
             let next_worker = slice_id % worker_txs.len();
             if let Err(e) = worker_txs[next_worker]
                 .send(RetrievalMessage::Batch(response_data.clone()))
@@ -586,7 +638,7 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
             let mut next_worker = (next_worker + 1) % worker_txs.len();
 
             // If no ID, return early
-            let id = match id_opt {
+            let mut id = match id_opt {
                 Some(id) => id,
                 None => {
                     return Err(anyhow!(
@@ -656,6 +708,7 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                         } else {
                             debug!("Slice {}: No search_after values available", slice_id);
                         }
+                        debug!("Next PIT body: {}", serde_json::to_string(&next_pit_body).unwrap_or_default());
 
                         client
                             .search(SearchParts::None)
@@ -716,6 +769,8 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 };
 
+                debug!("Slice {}: Next response JSON: {}", slice_id, serde_json::to_string(&next_response_json).unwrap_or_default());
+
                 // Check if we have any hits
                 let hits = next_response_json["hits"]["hits"].as_array();
                 if hits.map_or(true, |h| h.is_empty()) {
@@ -723,9 +778,30 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     break; // No more hits
                 }
 
+                // For PIT search, update the PIT ID from the response
+                if is_pit {
+                    if let Some(new_pit_id) = next_response_json.get("pit_id").and_then(Value::as_str) {
+                        debug!("Slice {}: Updating PIT ID to {}", slice_id, new_pit_id);
+                        id = new_pit_id.to_string();
+                    }
+                }
+
+                // Update search_after with sort values from the last hit for next pagination
+                if is_pit {
+                    if let Some(hits_array) = hits {
+                        if let Some(last_hit) = hits_array.last() {
+                            if let Some(sort) = last_hit.get("sort") {
+                                debug!("Slice {}: Updating search_after with new values from last hit", slice_id);
+                                search_after = Some(sort.clone());
+                            }
+                        }
+                    }
+                }
+
                 // Count hits
+                let mut batch_size = 0;
                 if let Some(hits_array) = hits {
-                    let batch_size = hits_array.len();
+                    batch_size = hits_array.len();
                     retrieved_hits += batch_size as u64;
                     debug!(
                         "Slice {}: Retrieved batch with {} documents (total: {})",
@@ -733,13 +809,20 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     );
                 }
 
-                // For PIT, update search_after for next iteration from the last hit's sort values
-                if is_pit {
-                    if let Some(last_hit) = hits.and_then(|h| h.last()) {
-                        if let Some(sort) = last_hit.get("sort") {
-                            search_after = Some(sort.clone());
-                        }
-                    }
+                // Estimate batch size
+                let batch_bytes = next_response_json.to_string().len() as u64;
+
+                // Increment retrieved count and update input bar for subsequent batches
+                let current_retrieved = retrieved_count
+                    .fetch_add(batch_size as u64, Ordering::Relaxed)
+                    + batch_size as u64;
+                let current_bytes_retrieved =
+                    retrieved_bytes.fetch_add(batch_bytes, Ordering::Relaxed) + batch_bytes;
+                if let Some(ib) = &input_bar {
+                    ib.set_position(current_retrieved);
+                    let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6);
+                    let bytes_per_sec = current_bytes_retrieved as f64 / elapsed_secs;
+                    ib.set_message(format!("{} /s", ByteSize(bytes_per_sec as u64)));
                 }
 
                 // Send the batch to the next worker in round-robin fashion
@@ -815,7 +898,8 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
             let processed_tx = processed_tx.clone();
             let processed_count = Arc::clone(&processed_count);
             let processed_bytes = Arc::clone(&processed_bytes);
-            let pb = progress_bar.clone();
+            let output_bar = output_bar.clone(); // Clone for worker task
+            let start_time = start_time.clone(); // Clone start_time for rate calculation
 
             tokio::spawn(async move {
                 while let Some(message) = rx.recv().await {
@@ -834,18 +918,18 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                             processed_bytes.fetch_add(bytes_count, Ordering::Relaxed);
 
                             // Update progress bar
-                            if let Some(pb) = &pb {
+                            if let Some(ob) = &output_bar {
                                 let current = processed_count.load(Ordering::Relaxed);
-                                pb.set_position(current);
+                                ob.set_position(current);
 
                                 let bytes = processed_bytes.load(Ordering::Relaxed);
-                                let elapsed_secs = start_time.elapsed().as_secs_f64();
+                                let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6); // Avoid division by zero
                                 let bytes_per_sec = bytes as f64 / elapsed_secs;
-                                pb.set_message(format!(
+                                ob.set_message(format!(
                                     "{} @ {}/s",
                                     ByteSize(bytes),
                                     ByteSize(bytes_per_sec as u64)
-                                ));
+                                )); // Set message with bytes/sec
                             }
 
                             // Send to output channel
@@ -907,14 +991,23 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
         }
     }
 
-    // Final update of progress bar total
-    if let Some(pb) = &progress_bar {
+    // Final update of progress bar total (length should be set by retrieval tasks now)
+    if let Some(ib) = &input_bar {
         debug!(
-            "Setting final progress bar length to total hits: {}",
+            "Input bar final length: {}, Total hits: {}",
+            ib.length().unwrap_or(0),
             total_hits
         );
-        pb.set_length(total_hits);
-        info!("Total documents to process: {}", total_hits);
+        // Ensure the length is correctly set if only one slice ran quickly
+        if ib.length().unwrap_or(0) != total_hits {
+            ib.set_length(total_hits);
+            ib.set_message("Retrieving...");
+        }
+    }
+    if let Some(ob) = &output_bar {
+        if ob.length().unwrap_or(0) != total_hits {
+            ob.set_length(total_hits);
+        }
     }
 
     // Signal that we're done retrieving by sending Done to all workers
@@ -926,8 +1019,10 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
 
     // Wait for all workers to finish
     for (i, task) in worker_tasks.into_iter().enumerate() {
-        if let Err(e) = task.await {
-            return Err(anyhow!("Worker {} task panicked: {}", i, e));
+        match task.await {
+            Ok(Ok(())) => {} // Worker finished successfully
+            Ok(Err(e)) => return Err(anyhow!("Worker {} processing failed: {}", i, e)), // Worker returned an error
+            Err(e) => return Err(anyhow!("Worker {} task panicked: {}", i, e)), // Worker panicked
         }
     }
 
@@ -943,15 +1038,30 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
         }
     }
 
-    if let Some(pb) = progress_bar {
-        let count = processed_count.load(Ordering::Relaxed);
-        let bytes = processed_bytes.load(Ordering::Relaxed);
-        pb.finish_with_message(format!("Dumped {} documents ({})", count, ByteSize(bytes)));
-    }
-
     let elapsed = start_time.elapsed();
     let count = processed_count.load(Ordering::Relaxed);
     let bytes = processed_bytes.load(Ordering::Relaxed);
+
+    // Finish progress bars
+    let final_retrieved_bytes = retrieved_bytes.load(Ordering::Relaxed);
+    if let Some(ib) = input_bar {
+        ib.finish_with_message(format!(
+            "Retrieved {} docs ({})",
+            total_hits,
+            ByteSize(final_retrieved_bytes)
+        ));
+    }
+    if let Some(ob) = output_bar {
+        ob.finish_with_message(format!("Processed {} docs ({})", count, ByteSize(bytes)));
+    }
+
+    // Wait for MultiProgress to finish drawing if it exists
+    if let Some(_mp) = multi_progress {
+        // mp.join().unwrap(); // Optional: Wait for bars to redraw completely
+        // Drop mp explicitly perhaps, or rely on scope drop.
+        // Depending on terminal behavior, might need explicit join/wait.
+        // Let's omit for now unless redraw issues appear.
+    }
 
     debug!(
         "Final stats: {} documents, {} bytes, {:?} elapsed",

@@ -342,6 +342,7 @@ dependencies = [
  "bytesize",
  "chrono",
  "clap",
+ "console",
  "elasticsearch",
  "env_logger",
  "futures",
