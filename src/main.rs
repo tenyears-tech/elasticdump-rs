@@ -529,14 +529,36 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            let search_response: Value = match response.json().await {
+            // Read bytes first to get accurate size
+            let response_bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(anyhow!(
+                        "Slice {}: Failed to read initial response bytes: {}",
+                        slice_id,
+                        e
+                    ));
+                }
+            };
+
+            let initial_bytes = response_bytes.len() as u64;
+            debug!(
+                "Slice {}: Read {} bytes for initial response",
+                slice_id, initial_bytes
+            );
+
+            // Now parse the JSON from bytes
+            let search_response: Value = match serde_json::from_slice(&response_bytes) {
                 Ok(json) => {
-                    debug!("Slice {}: Successfully parsed initial response", slice_id);
+                    debug!(
+                        "Slice {}: Successfully parsed initial response from bytes",
+                        slice_id
+                    );
                     json
                 }
                 Err(e) => {
                     return Err(anyhow!(
-                        "Slice {}: Failed to parse initial response: {} - this might indicate malformed JSON or unexpected response format",
+                        "Slice {}: Failed to parse initial response from bytes: {} - this might indicate malformed JSON or unexpected response format",
                         slice_id,
                         e
                     ));
@@ -600,9 +622,6 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
             let initial_hits = response_data["hits"]["hits"]
                 .as_array()
                 .map_or(0, |h| h.len()) as u64;
-
-            // Estimate initial batch size (string length is an approximation)
-            let initial_bytes = response_data.to_string().len() as u64;
 
             // Increment retrieved count and update input bar for initial batch
             let current_retrieved =
@@ -768,11 +787,66 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 };
 
-                let next_response_json: Value = match next_response.json().await {
+                // Read bytes first to get accurate size
+                let next_response_bytes = match next_response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        // Attempt cleanup before returning the error
+                        match search_type {
+                            SearchType::Scroll => {
+                                let clear_scroll_body = json!({ "scroll_id": [id.clone()] });
+                                let _ = client
+                                    .clear_scroll(ClearScrollParts::None)
+                                    .body(clear_scroll_body)
+                                    .send()
+                                    .await;
+                            }
+                            SearchType::PointInTime => {
+                                let _ = client
+                                    .close_point_in_time()
+                                    .body(json!({ "id": id }))
+                                    .send()
+                                    .await;
+                            }
+                        }
+                        return Err(anyhow!(
+                            "Slice {}: Failed to read continuation response bytes: {}",
+                            slice_id,
+                            e
+                        ));
+                    }
+                };
+
+                let batch_bytes = next_response_bytes.len() as u64;
+                debug!(
+                    "Slice {}: Read {} bytes for continuation response",
+                    slice_id, batch_bytes
+                );
+
+                // Now parse the JSON from bytes
+                let next_response_json: Value = match serde_json::from_slice(&next_response_bytes) {
                     Ok(json) => json,
                     Err(e) => {
+                        // Attempt cleanup before returning the error
+                        match search_type {
+                            SearchType::Scroll => {
+                                let clear_scroll_body = json!({ "scroll_id": [id.clone()] });
+                                let _ = client
+                                    .clear_scroll(ClearScrollParts::None)
+                                    .body(clear_scroll_body)
+                                    .send()
+                                    .await;
+                            }
+                            SearchType::PointInTime => {
+                                let _ = client
+                                    .close_point_in_time()
+                                    .body(json!({ "id": id }))
+                                    .send()
+                                    .await;
+                            }
+                        }
                         return Err(anyhow!(
-                            "Slice {}: Failed to parse continuation response: {}",
+                            "Slice {}: Failed to parse continuation response from bytes: {}",
                             slice_id,
                             e
                         ));
@@ -806,13 +880,11 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                 if is_pit {
                     if let Some(hits_array) = hits {
                         if let Some(last_hit) = hits_array.last() {
-                            if let Some(sort) = last_hit.get("sort") {
-                                debug!(
-                                    "Slice {}: Updating search_after with new values from last hit",
-                                    slice_id
-                                );
-                                search_after = Some(sort.clone());
-                            }
+                            debug!(
+                                "Slice {}: Updating search_after with new values from last hit",
+                                slice_id
+                            );
+                            search_after = Some(last_hit.get("sort").cloned().unwrap_or_default());
                         }
                     }
                 }
@@ -827,9 +899,6 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                         slice_id, batch_size, retrieved_hits
                     );
                 }
-
-                // Estimate batch size
-                let batch_bytes = next_response_json.to_string().len() as u64;
 
                 // Increment retrieved count and update input bar for subsequent batches
                 let current_retrieved = retrieved_count
