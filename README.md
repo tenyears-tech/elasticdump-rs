@@ -114,22 +114,22 @@ This tool is inspired by the Node.js [elasticdump](https://github.com/elasticsea
 In performance tests on a modern machine with a local Elasticsearch instance, `elasticdump-rs` can typically process thousands of documents per second.
 
 ```shell
-❯ http -b "http://localhost:9200/_cat/indices/elasticdump_rs_test_manual_1745051857?v"
+❯ http -b "http://localhost:9200/_cat/indices/elasticdump_rs_test_manual_1744878888?v"
 health status index                                 uuid                   pri rep docs.count docs.deleted store.size pri.store.size
-green  open   elasticdump_rs_test_manual_1745051857 usRVx88yTeO9_LOFk-7aPQ   1   0    1000100            0    132.4mb        132.4mb
+green  open   elasticdump_rs_test_manual_1744878888 -Y-aMCVCSjyWs4jzYQdXDg   1   0    1000100            0    132.6mb        132.6mb
 
-❯ elasticdump-rs --input=http://localhost:9200/elasticdump_rs_test_manual_1745051857 --output=$ --limit=10000 --quiet | pv -tab | wc -l
- 741MiB 0:00:03 ( 220MiB/s)
+❯ elasticdump-rs --input=http://localhost:9200/elasticdump_rs_test_manual_1744878888 --output=$ --limit=10000 --quiet | pv -tab | wc -l
+ 741MiB 0:00:02 ( 292MiB/s)
  1000100
 
-❯ elasticdump --input=http://localhost:9200/elasticdump_rs_test_manual_1745051857 --output=$ --limit=10000 --quiet | pv -tab | wc -l
- 739MiB 0:00:10 (72.1MiB/s)
+❯ elasticdump --input=http://localhost:9200/elasticdump_rs_test_manual_1744878888 --output=$ --limit=10000 --quiet | pv -tab | wc -l
+ 739MiB 0:00:11 (65.0MiB/s)
  1000100
 ```
 
 *Note: The minor difference in output sizes (e.g., 741MiB vs 739MiB in the example) is due to differences in JSON serialization. `elasticdump-rs` represents floating-point numbers like `0.0` accurately, while the original Node.js `elasticdump` may represent them as integers (`0`), resulting in slightly smaller output.*
 
-*Note: These are results from rough tests performed on an M2 MacBook Air.*
+*Note: These are results from rough tests performed on M1 Max MacBook Pro.*
 
 ## Testing
 
