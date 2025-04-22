@@ -1,17 +1,20 @@
-mod retrieval_task;
-mod progress;
 mod messages;
+mod progress;
+mod retrieval_task;
 mod search_body;
 
 use anyhow::Result;
 use bytesize::ByteSize;
 use elasticsearch::Elasticsearch;
-use log::{debug, info};
 use indicatif::{MultiProgress, ProgressDrawTarget};
+use log::{debug, info};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Instant;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
-use std::time::Instant;
 
 use crate::cli::Cli;
 
@@ -30,7 +33,7 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
 
     // Prepare search body from user input
     let search_body = search_body::prepare_search_body(&args).await?;
-    
+
     // Create channels for the pipeline
     let workers = args.workers;
     let buffer_size = args.buffer_size;
@@ -128,9 +131,10 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     match message {
                         RetrievalMessage::Batch(batch) => {
                             // Move CPU-bound work to blocking thread pool
-                            let processed =
-                                tokio::task::spawn_blocking(move || crate::processing::process_batch(&batch))
-                                    .await??;
+                            let processed = tokio::task::spawn_blocking(move || {
+                                crate::processing::process_batch(&batch)
+                            })
+                            .await??;
 
                             // Update counters
                             let doc_count = processed.doc_count;
@@ -242,8 +246,8 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
     for (i, task) in worker_tasks.into_iter().enumerate() {
         match task.await {
             Ok(Ok(())) => {} // Worker finished successfully
-            Ok(Err(e)) => return Err(anyhow::anyhow!("Worker {} processing failed: {}", i, e)), 
-            Err(e) => return Err(anyhow::anyhow!("Worker {} task panicked: {}", i, e)), 
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Worker {} processing failed: {}", i, e)),
+            Err(e) => return Err(anyhow::anyhow!("Worker {} task panicked: {}", i, e)),
         }
     }
 
@@ -262,18 +266,28 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
     let elapsed = start_time.elapsed();
     let count = processed_count.load(Ordering::Relaxed);
     let bytes = processed_bytes.load(Ordering::Relaxed);
+    let elapsed_secs = elapsed.as_secs_f64().max(1e-6);
+    let bytes_per_sec = bytes as f64 / elapsed_secs;
+    let docs_per_sec = count as f64 / elapsed_secs;
 
     // Finish progress bars
     let final_retrieved_bytes = retrieved_bytes.load(Ordering::Relaxed);
+    let retrieved_bytes_per_sec = final_retrieved_bytes as f64 / elapsed_secs;
     if let Some(ib) = input_bar {
         ib.finish_with_message(format!(
-            "Retrieved {} docs ({})",
+            "Retrieved {} docs ({} @ {} /s)",
             total_hits,
-            ByteSize(final_retrieved_bytes)
+            ByteSize(final_retrieved_bytes),
+            ByteSize(retrieved_bytes_per_sec as u64)
         ));
     }
     if let Some(ob) = output_bar {
-        ob.finish_with_message(format!("Processed {} docs ({})", count, ByteSize(bytes)));
+        ob.finish_with_message(format!(
+            "Processed {} docs ({} @ {} /s)",
+            count,
+            ByteSize(bytes),
+            ByteSize(bytes_per_sec as u64)
+        ));
     }
 
     debug!(
@@ -286,9 +300,9 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
         count,
         ByteSize(bytes),
         elapsed,
-        count as f64 / elapsed.as_secs_f64(),
-        ByteSize((bytes as f64 / elapsed.as_secs_f64()) as u64)
+        docs_per_sec,
+        ByteSize(bytes_per_sec as u64)
     );
 
     Ok(())
-} 
+}
