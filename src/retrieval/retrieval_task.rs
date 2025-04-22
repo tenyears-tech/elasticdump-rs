@@ -257,7 +257,7 @@ pub fn spawn_retrieval_task(
             let bytes_per_sec = current_bytes_retrieved as f64 / elapsed_secs;
             ib.set_message(format!(
                 "{} @ {} /s",
-                ByteSize(current_retrieved),
+                ByteSize(current_bytes_retrieved),
                 ByteSize(bytes_per_sec as u64)
             ));
         }
@@ -535,7 +535,7 @@ pub fn spawn_retrieval_task(
                 let bytes_per_sec = current_bytes_retrieved as f64 / elapsed_secs;
                 ib.set_message(format!(
                     "{} @ {} /s",
-                    ByteSize(current_retrieved),
+                    ByteSize(current_bytes_retrieved),
                     ByteSize(bytes_per_sec as u64)
                 ));
             }

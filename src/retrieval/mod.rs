@@ -149,7 +149,7 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                                 let bytes_per_sec = bytes as f64 / elapsed_secs;
                                 ob.set_message(format!(
                                     "{} @ {} /s",
-                                    ByteSize(current),
+                                    ByteSize(bytes),
                                     ByteSize(bytes_per_sec as u64)
                                 ));
                             }
