@@ -357,7 +357,7 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
         let pb = mp.add(ProgressBar::new(0));
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.yellow/red}]  Input: {pos}/{len} ({per_sec}, {bytes_per_sec}) {eta}")
+                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.yellow/red}]  Input: {pos}/{len} ({per_sec}, {msg}) {eta}")
                 .unwrap()
                 .progress_chars("#>-"),
         );
@@ -371,7 +371,7 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
         let pb = mp.add(ProgressBar::new(0));
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.blue} [{elapsed_precise}] [{wide_bar:.cyan/blue}] Output: {pos}/{len} ({per_sec}, {bytes_per_sec}) {eta}")
+                .template("{spinner:.blue} [{elapsed_precise}] [{wide_bar:.cyan/blue}] Output: {pos}/{len} ({per_sec}, {msg}) {eta}")
                 .unwrap()
                 .progress_chars("#>-"),
         );
@@ -501,7 +501,10 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     if !search_body.contains_key("sort") {
                         search_body.insert("sort".to_string(), json!(["_id"]));
                     }
-                    debug!("Search body: {}", serde_json::to_string(&search_body).unwrap_or_default());
+                    debug!(
+                        "Search body: {}",
+                        serde_json::to_string(&search_body).unwrap_or_default()
+                    );
 
                     // Execute search with PIT ID
                     client
@@ -610,7 +613,11 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                 ib.set_position(current_retrieved);
                 let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6);
                 let bytes_per_sec = current_bytes_retrieved as f64 / elapsed_secs;
-                ib.set_message(format!("{} /s", ByteSize(bytes_per_sec as u64)));
+                ib.set_message(format!(
+                    "{} @ {} /s",
+                    ByteSize(current_retrieved),
+                    ByteSize(bytes_per_sec as u64)
+                ));
             }
 
             let next_worker = slice_id % worker_txs.len();
@@ -708,7 +715,10 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                         } else {
                             debug!("Slice {}: No search_after values available", slice_id);
                         }
-                        debug!("Next PIT body: {}", serde_json::to_string(&next_pit_body).unwrap_or_default());
+                        debug!(
+                            "Next PIT body: {}",
+                            serde_json::to_string(&next_pit_body).unwrap_or_default()
+                        );
 
                         client
                             .search(SearchParts::None)
@@ -769,7 +779,11 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 };
 
-                debug!("Slice {}: Next response JSON: {}", slice_id, serde_json::to_string(&next_response_json).unwrap_or_default());
+                debug!(
+                    "Slice {}: Next response JSON: {}",
+                    slice_id,
+                    serde_json::to_string(&next_response_json).unwrap_or_default()
+                );
 
                 // Check if we have any hits
                 let hits = next_response_json["hits"]["hits"].as_array();
@@ -780,7 +794,9 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
 
                 // For PIT search, update the PIT ID from the response
                 if is_pit {
-                    if let Some(new_pit_id) = next_response_json.get("pit_id").and_then(Value::as_str) {
+                    if let Some(new_pit_id) =
+                        next_response_json.get("pit_id").and_then(Value::as_str)
+                    {
                         debug!("Slice {}: Updating PIT ID to {}", slice_id, new_pit_id);
                         id = new_pit_id.to_string();
                     }
@@ -791,7 +807,10 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     if let Some(hits_array) = hits {
                         if let Some(last_hit) = hits_array.last() {
                             if let Some(sort) = last_hit.get("sort") {
-                                debug!("Slice {}: Updating search_after with new values from last hit", slice_id);
+                                debug!(
+                                    "Slice {}: Updating search_after with new values from last hit",
+                                    slice_id
+                                );
                                 search_after = Some(sort.clone());
                             }
                         }
@@ -822,7 +841,11 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     ib.set_position(current_retrieved);
                     let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6);
                     let bytes_per_sec = current_bytes_retrieved as f64 / elapsed_secs;
-                    ib.set_message(format!("{} /s", ByteSize(bytes_per_sec as u64)));
+                    ib.set_message(format!(
+                        "{} @ {} /s",
+                        ByteSize(current_retrieved),
+                        ByteSize(bytes_per_sec as u64)
+                    ));
                 }
 
                 // Send the batch to the next worker in round-robin fashion
@@ -926,8 +949,8 @@ async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                                 let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6); // Avoid division by zero
                                 let bytes_per_sec = bytes as f64 / elapsed_secs;
                                 ob.set_message(format!(
-                                    "{} @ {}/s",
-                                    ByteSize(bytes),
+                                    "{} @ {} /s",
+                                    ByteSize(current),
                                     ByteSize(bytes_per_sec as u64)
                                 )); // Set message with bytes/sec
                             }
