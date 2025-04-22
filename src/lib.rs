@@ -1,12 +1,12 @@
 pub mod cli;
 pub mod elasticsearch;
-pub mod retrieval;
-pub mod processing;
 pub mod output;
+pub mod processing;
+pub mod retrieval;
 
 pub async fn run() -> anyhow::Result<()> {
     use clap::Parser;
-    
+
     let args = cli::Cli::parse();
 
     // Configure logger based on debug flag
@@ -27,7 +27,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Parse input URL and extract host/index information
     let (host_url, index, auth_username, auth_password) = elasticsearch::parse_input_url(&args)?;
-    
+
     log::info!(
         "Dumping data from index: {} at {}",
         index,
@@ -35,11 +35,12 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     // Set up Elasticsearch client
-    let client = elasticsearch::create_client(host_url, auth_username, auth_password, args.es_compress)?;
+    let client =
+        elasticsearch::create_client(host_url, auth_username, auth_password, args.es_compress)?;
 
     // Set up output writer
     let writer = output::create_output_writer(&args).await?;
-    
+
     // Perform the data dump
     retrieval::dump_data(&client, &index, args, writer).await
-} 
+}

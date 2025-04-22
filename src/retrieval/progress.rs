@@ -26,4 +26,4 @@ pub fn setup_progress_bars(mp: &MultiProgress) -> (Option<ProgressBar>, Option<P
     };
 
     (input_bar, output_bar)
-} 
+}

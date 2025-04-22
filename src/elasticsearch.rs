@@ -41,25 +41,33 @@ pub fn parse_input_url(args: &Cli) -> Result<(Url, String, Option<String>, Optio
     let url_username = input_url.username();
     let url_password = input_url.password();
 
-    let auth_username = args.username.as_deref().or_else(|| {
-        if !url_username.is_empty() {
-            Some(url_username)
-        } else {
-            None
-        }
-    }).map(|s| s.to_string());
-    
-    let auth_password = args.password.as_deref().or(url_password).map(|s| s.to_string());
+    let auth_username = args
+        .username
+        .as_deref()
+        .or_else(|| {
+            if !url_username.is_empty() {
+                Some(url_username)
+            } else {
+                None
+            }
+        })
+        .map(|s| s.to_string());
+
+    let auth_password = args
+        .password
+        .as_deref()
+        .or(url_password)
+        .map(|s| s.to_string());
 
     Ok((host_url, index, auth_username, auth_password))
 }
 
 /// Create and configure the Elasticsearch client
 pub fn create_client(
-    host_url: Url, 
-    auth_username: Option<String>, 
-    auth_password: Option<String>, 
-    enable_compression: bool
+    host_url: Url,
+    auth_username: Option<String>,
+    auth_password: Option<String>,
+    enable_compression: bool,
 ) -> Result<Elasticsearch> {
     log::debug!(
         "Setting up Elasticsearch client connection to {}",
@@ -77,12 +85,16 @@ pub fn create_client(
         headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_val)?);
         log::debug!("Adding authorization header");
     } else if auth_username.is_some() || auth_password.is_some() {
-        log::warn!("Partial basic auth credentials provided (username or password missing), ignoring.");
+        log::warn!(
+            "Partial basic auth credentials provided (username or password missing), ignoring."
+        );
     }
 
     // Add Accept-Encoding: identity by default, unless --esCompress is set
     if !enable_compression {
-        log::debug!("Disabling response compression by setting Accept-Encoding: identity (default)");
+        log::debug!(
+            "Disabling response compression by setting Accept-Encoding: identity (default)"
+        );
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     } else {
         log::debug!("Allowing Elasticsearch response compression (--esCompress specified)");
@@ -97,7 +109,7 @@ pub fn create_client(
     let transport = transport_builder
         .build()
         .context("Failed to build Elasticsearch transport")?;
-    
+
     log::debug!("Elasticsearch client created successfully");
     Ok(Elasticsearch::new(transport))
-} 
+}

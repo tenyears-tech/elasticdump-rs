@@ -84,4 +84,4 @@ pub struct Cli {
     /// Enable Elasticsearch response compression (default: disabled)
     #[clap(long("esCompress"))]
     pub es_compress: bool,
-} 
+}

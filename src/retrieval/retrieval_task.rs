@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bytesize::ByteSize;
 use elasticsearch::{
     ClearScrollParts, Elasticsearch, OpenPointInTimeParts, ScrollParts, SearchParts,
 };
 use indicatif::ProgressBar;
 use log::{debug, info, warn};
-use serde_json::{json, Value};
+use sonic_rs::{JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value, json};
 use std::{
     sync::{
         Arc,
@@ -15,14 +15,14 @@ use std::{
 };
 use tokio::sync::mpsc::Sender;
 
-use crate::cli::SearchType;
 use super::messages::RetrievalMessage;
+use crate::cli::SearchType;
 
 /// Spawn a retrieval task for a specific slice
 pub fn spawn_retrieval_task(
     slice_id: usize,
     client: Elasticsearch,
-    index: String, 
+    index: String,
     worker_txs: Vec<Sender<RetrievalMessage>>,
     mut search_body: Value,
     search_type: SearchType,
@@ -31,7 +31,7 @@ pub fn spawn_retrieval_task(
     use_sliced_scroll: bool,
     num_slices: usize,
     total_hits_count: Arc<AtomicU64>,
-    input_bar: Option<ProgressBar>, 
+    input_bar: Option<ProgressBar>,
     output_bar: Option<ProgressBar>,
     retrieved_count: Arc<AtomicU64>,
     retrieved_bytes: Arc<AtomicU64>,
@@ -41,7 +41,7 @@ pub fn spawn_retrieval_task(
     let mut search_body_obj = search_body.as_object_mut().unwrap().clone();
     if use_sliced_scroll {
         search_body_obj.insert(
-            "slice".to_string(),
+            &"slice",
             json!({
                 "id": slice_id,
                 "max": num_slices
@@ -82,7 +82,7 @@ pub fn spawn_retrieval_task(
                 let pit_id = match pit_response {
                     Ok(resp) => {
                         debug!("Slice {}: PIT opened successfully", slice_id);
-                        let pit_json: Value = match resp.json().await {
+                        let pit_json: serde_json::Value = match resp.json().await {
                             Ok(json) => json,
                             Err(e) => {
                                 return Err(anyhow!(
@@ -93,7 +93,7 @@ pub fn spawn_retrieval_task(
                             }
                         };
 
-                        match pit_json.get("id").and_then(Value::as_str) {
+                        match pit_json.get("id").and_then(serde_json::Value::as_str) {
                             Some(id) => {
                                 debug!("Slice {}: Got PIT ID: {}", slice_id, id);
                                 id.to_string()
@@ -113,7 +113,7 @@ pub fn spawn_retrieval_task(
 
                 // Add PIT to search body
                 search_body_obj.insert(
-                    "pit".to_string(),
+                    &"pit",
                     json!({
                         "id": pit_id,
                         "keep_alive": pit_keep_alive
@@ -121,12 +121,12 @@ pub fn spawn_retrieval_task(
                 );
 
                 // Add default sort to make search_after work reliably
-                if !search_body_obj.contains_key("sort") {
-                    search_body_obj.insert("sort".to_string(), json!(["_id"]));
+                if !search_body_obj.contains_key(&"sort") {
+                    search_body_obj.insert(&"sort", json!(["_id"]));
                 }
                 debug!(
                     "Search body: {}",
-                    serde_json::to_string(&search_body_obj).unwrap_or_default()
+                    sonic_rs::to_string(&search_body_obj).unwrap_or_default()
                 );
 
                 // Execute search with PIT ID
@@ -171,7 +171,7 @@ pub fn spawn_retrieval_task(
         );
 
         // Now parse the JSON from bytes
-        let search_response: Value = match serde_json::from_slice(&response_bytes) {
+        let search_response: Value = match sonic_rs::from_slice(&response_bytes) {
             Ok(json) => {
                 debug!(
                     "Slice {}: Successfully parsed initial response from bytes",
@@ -193,7 +193,7 @@ pub fn spawn_retrieval_task(
             SearchType::Scroll => {
                 let scroll_id = search_response
                     .get("_scroll_id")
-                    .and_then(Value::as_str)
+                    .as_str()
                     .map(|id| id.to_string());
 
                 if let Some(id) = &scroll_id {
@@ -209,9 +209,9 @@ pub fn spawn_retrieval_task(
                 // We need to extract it from search_body since we added it there
                 (
                     search_body_obj
-                        .get("pit")
-                        .and_then(|pit| pit.get("id"))
-                        .and_then(Value::as_str)
+                        .get(&"pit")
+                        .and_then(|pit| pit.get(&"id"))
+                        .as_str()
                         .map(|id| id.to_string()),
                     true,
                 )
@@ -341,25 +341,43 @@ pub fn spawn_retrieval_task(
                     // 3. Any other search params (query, etc.)
                     let mut next_pit_body = search_body_obj.clone();
 
+                    // Update the PIT ID in the search body
+                    if next_pit_body.contains_key(&"pit") {
+                        if let Some(pit_obj) = next_pit_body["pit"].as_object_mut() {
+                            pit_obj.insert(&"id", json!(id));
+                            debug!("Slice {}: Updated PIT ID in search body", slice_id);
+                        }
+                    } else {
+                        // If pit object doesn't exist, create it
+                        next_pit_body.insert(
+                            &"pit",
+                            json!({
+                                "id": id,
+                                "keep_alive": pit_keep_alive
+                            }),
+                        );
+                        debug!("Slice {}: Added PIT ID to search body", slice_id);
+                    }
+
                     // Make sure we have a sort parameter (required for search_after)
-                    if !next_pit_body.contains_key("sort") {
+                    if !next_pit_body.contains_key(&"sort") {
                         debug!(
                             "Slice {}: Adding default sort by _id for PIT search",
                             slice_id
                         );
-                        next_pit_body.insert("sort".to_string(), json!(["_id"]));
+                        next_pit_body.insert(&"sort", json!(["_id"]));
                     }
 
                     // Add search_after from the last response if available
                     if let Some(sort_values) = &search_after {
                         debug!("Slice {}: Using search_after from last result", slice_id);
-                        next_pit_body.insert("search_after".to_string(), sort_values.clone());
+                        next_pit_body.insert(&"search_after", sort_values.clone());
                     } else {
                         debug!("Slice {}: No search_after values available", slice_id);
                     }
                     debug!(
                         "Next PIT body: {}",
-                        serde_json::to_string(&next_pit_body).unwrap_or_default()
+                        sonic_rs::to_string(&next_pit_body).unwrap_or_default()
                     );
 
                     client
@@ -391,10 +409,7 @@ pub fn spawn_retrieval_task(
                                 .await;
                         }
                         SearchType::PointInTime => {
-                            debug!(
-                                "Slice {}: Attempting to clean up PIT after error",
-                                slice_id
-                            );
+                            debug!("Slice {}: Attempting to clean up PIT after error", slice_id);
                             let _ = client
                                 .close_point_in_time()
                                 .body(json!({ "id": id }))
@@ -447,7 +462,7 @@ pub fn spawn_retrieval_task(
             );
 
             // Now parse the JSON from bytes
-            let next_response_json: Value = match serde_json::from_slice(&next_response_bytes) {
+            let next_response_json: Value = match sonic_rs::from_slice(&next_response_bytes) {
                 Ok(json) => json,
                 Err(e) => {
                     // Attempt cleanup before returning the error
@@ -479,7 +494,7 @@ pub fn spawn_retrieval_task(
             debug!(
                 "Slice {}: Next response JSON: {}",
                 slice_id,
-                serde_json::to_string(&next_response_json).unwrap_or_default()
+                sonic_rs::to_string(&next_response_json).unwrap_or_default()
             );
 
             // Check if we have any hits
@@ -490,10 +505,10 @@ pub fn spawn_retrieval_task(
             }
 
             // For PIT search, update the PIT ID from the response
+            // IMPORTANT: The open point in time request and each subsequent search request can return
+            // different identifiers; always use the most recently received ID for the next search request.
             if is_pit {
-                if let Some(new_pit_id) =
-                    next_response_json.get("pit_id").and_then(Value::as_str)
-                {
+                if let Some(new_pit_id) = next_response_json.get(&"pit_id").as_str() {
                     debug!("Slice {}: Updating PIT ID to {}", slice_id, new_pit_id);
                     id = new_pit_id.to_string();
                 }
@@ -524,9 +539,8 @@ pub fn spawn_retrieval_task(
             }
 
             // Increment retrieved count and update input bar for subsequent batches
-            let current_retrieved = retrieved_count
-                .fetch_add(batch_size as u64, Ordering::Relaxed)
-                + batch_size as u64;
+            let current_retrieved =
+                retrieved_count.fetch_add(batch_size as u64, Ordering::Relaxed) + batch_size as u64;
             let current_bytes_retrieved =
                 retrieved_bytes.fetch_add(batch_bytes, Ordering::Relaxed) + batch_bytes;
             if let Some(ib) = &input_bar {
@@ -601,4 +615,4 @@ pub fn spawn_retrieval_task(
         );
         Ok(slice_total_hits)
     })
-} 
+}

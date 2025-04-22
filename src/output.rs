@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 use tokio::{
     fs as tokio_fs,
     io::{AsyncWrite, BufWriter as TokioBufWriter, stdout as tokio_stdout},
 };
-use std::path::Path;
 
 use crate::cli::Cli;
 
@@ -13,7 +13,7 @@ pub type OutputWriter = TokioBufWriter<Box<dyn AsyncWrite + Unpin + Send>>;
 /// Create an output writer based on CLI arguments
 pub async fn create_output_writer(args: &Cli) -> Result<OutputWriter> {
     log::debug!("Setting up output writer");
-    
+
     if args.output == "$" {
         // Write to stdout
         log::debug!("Using stdout for output");
@@ -24,7 +24,7 @@ pub async fn create_output_writer(args: &Cli) -> Result<OutputWriter> {
         log::debug!("Using file for output: {}", args.output);
         let mut open_options = tokio_fs::OpenOptions::new();
         open_options.write(true).create(true);
-        
+
         if args.overwrite {
             log::debug!("Output file will be overwritten if it exists");
             open_options.truncate(true);
@@ -47,4 +47,4 @@ pub async fn create_output_writer(args: &Cli) -> Result<OutputWriter> {
         log::debug!("Output file opened successfully");
         Ok(TokioBufWriter::new(Box::new(file)))
     }
-} 
+}

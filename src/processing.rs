@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde_json::Value;
+use sonic_rs::{JsonContainerTrait, Value};
 
 /// Represents a processed batch ready for writing
 pub struct ProcessedBatch {
@@ -36,7 +36,7 @@ pub fn process_batch(response: &Value) -> Result<ProcessedBatch> {
 
     for hit in hits {
         // Serialize the entire hit document
-        serde_json::to_writer(&mut buffer, hit)?;
+        sonic_rs::to_writer(&mut buffer, hit)?;
         // Append a newline character
         buffer.push(b'\n');
     }
@@ -52,7 +52,7 @@ pub fn process_batch(response: &Value) -> Result<ProcessedBatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use sonic_rs::json;
 
     #[test]
     fn test_process_batch() {
@@ -106,8 +106,10 @@ mod tests {
         let line2_str = std::str::from_utf8(lines[1]).expect("Line 2 should be valid UTF-8");
 
         // Parse back to Value to compare
-        let parsed1: Value = serde_json::from_str(line1_str).expect("Line 1 should be valid JSON");
-        let parsed2: Value = serde_json::from_str(line2_str).expect("Line 2 should be valid JSON");
+        let parsed1: sonic_rs::Value =
+            sonic_rs::from_str(line1_str).expect("Line 1 should be valid JSON");
+        let parsed2: sonic_rs::Value =
+            sonic_rs::from_str(line2_str).expect("Line 2 should be valid JSON");
 
         // Verify the full document structure
         assert_eq!(parsed1["_id"], "doc1", "First document ID mismatch");
@@ -138,4 +140,4 @@ mod tests {
             "Second document source name mismatch"
         );
     }
-} 
+}
