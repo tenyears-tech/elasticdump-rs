@@ -647,6 +647,42 @@ async fn test_overwrite_flag() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_overwrite_preserves_existing_file_on_invalid_search_body() -> Result<()> {
+    let output_file = "test_output_invalid_search_body_preserve.jsonl";
+    let original_content = "keep me intact\n";
+    std::fs::write(output_file, original_content)?;
+
+    let output = Command::new("cargo")
+        .args(["run", "--"])
+        .args(&[
+            "--input",
+            "http://localhost:9200/nonexistent_index",
+            "--output",
+            output_file,
+            "--overwrite",
+            "--searchBody",
+            "{not valid json}",
+            "--quiet",
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "Command should fail when searchBody is invalid"
+    );
+
+    let final_content = std::fs::read_to_string(output_file)?;
+    assert_eq!(
+        final_content, original_content,
+        "Existing output should remain untouched when validation fails"
+    );
+
+    std::fs::remove_file(output_file)?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_performance_benchmark() -> Result<()> {
     // Get a unique test index and output file
     let test_index = get_unique_test_index();

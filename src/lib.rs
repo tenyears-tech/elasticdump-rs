@@ -38,9 +38,6 @@ pub async fn run() -> anyhow::Result<()> {
     let client =
         elasticsearch::create_client(host_url, auth_username, auth_password, args.es_compress)?;
 
-    // Set up output writer
-    let writer = output::create_output_writer(&args).await?;
-
     // Perform the data dump
-    retrieval::dump_data(&client, &index, args, writer).await
+    retrieval::dump_data(&client, &index, args).await
 }

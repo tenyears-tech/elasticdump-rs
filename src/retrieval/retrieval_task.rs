@@ -18,6 +18,56 @@ use tokio::sync::mpsc::Sender;
 use super::messages::RetrievalMessage;
 use crate::cli::SearchType;
 
+fn latest_scroll_id(response: &Value) -> Option<String> {
+    response.get("_scroll_id").as_str().map(|id| id.to_string())
+}
+
+fn latest_pit_id(response: &Value) -> Option<String> {
+    response.get("pit_id").as_str().map(|id| id.to_string())
+}
+
+fn refresh_search_id(search_type: &SearchType, response: &Value, id: &mut String) {
+    let latest_id = match search_type {
+        SearchType::Scroll => latest_scroll_id(response),
+        SearchType::PointInTime => latest_pit_id(response),
+    };
+
+    if let Some(new_id) = latest_id {
+        *id = new_id;
+    }
+}
+
+async fn cleanup_search_context(
+    client: &Elasticsearch,
+    search_type: &SearchType,
+    id: &str,
+    slice_id: usize,
+) {
+    match search_type {
+        SearchType::Scroll => {
+            let clear_scroll_body = json!({ "scroll_id": [id] });
+            if let Err(e) = client
+                .clear_scroll(ClearScrollParts::None)
+                .body(clear_scroll_body)
+                .send()
+                .await
+            {
+                warn!("Slice {}: Failed to clear scroll context: {}", slice_id, e);
+            }
+        }
+        SearchType::PointInTime => {
+            if let Err(e) = client
+                .close_point_in_time()
+                .body(json!({ "id": id }))
+                .send()
+                .await
+            {
+                warn!("Failed to close PIT for slice {}: {}", slice_id, e);
+            }
+        }
+    }
+}
+
 /// Spawn a retrieval task for a specific slice
 pub fn spawn_retrieval_task(
     slice_id: usize,
@@ -191,10 +241,7 @@ pub fn spawn_retrieval_task(
         // Extract ID for continued searches (scroll_id or pit.id)
         let (id_opt, is_pit) = match search_type {
             SearchType::Scroll => {
-                let scroll_id = search_response
-                    .get("_scroll_id")
-                    .as_str()
-                    .map(|id| id.to_string());
+                let scroll_id = latest_scroll_id(&search_response);
 
                 if let Some(id) = &scroll_id {
                     debug!("Slice {}: Got scroll_id: {}", slice_id, id);
@@ -207,14 +254,14 @@ pub fn spawn_retrieval_task(
             SearchType::PointInTime => {
                 // For PIT we already have the ID from the open_point_in_time call
                 // We need to extract it from search_body since we added it there
-                (
+                let latest_id = latest_pit_id(&search_response).or_else(|| {
                     search_body_obj
                         .get(&"pit")
                         .and_then(|pit| pit.get(&"id"))
                         .as_str()
-                        .map(|id| id.to_string()),
-                    true,
-                )
+                        .map(|id| id.to_string())
+                });
+                (latest_id, true)
             }
         };
 
@@ -267,15 +314,8 @@ pub fn spawn_retrieval_task(
             .send(RetrievalMessage::Batch(response_data.clone()))
             .await
         {
-            // Clean up PIT if needed before returning
-            if is_pit {
-                if let Some(id) = &id_opt {
-                    let _ = client
-                        .close_point_in_time()
-                        .body(json!({ "id": id }))
-                        .send()
-                        .await;
-                }
+            if let Some(id) = &id_opt {
+                cleanup_search_context(&client, &search_type, id, slice_id).await;
             }
             return Err(anyhow!(
                 "Failed to send initial batch for slice {}: {}",
@@ -394,29 +434,7 @@ pub fn spawn_retrieval_task(
                     res
                 }
                 Err(e) => {
-                    // Attempt to clean up before returning
-                    match search_type {
-                        SearchType::Scroll => {
-                            debug!(
-                                "Slice {}: Attempting to clean up scroll context after error",
-                                slice_id
-                            );
-                            let clear_scroll_body = json!({ "scroll_id": [id.clone()] });
-                            let _ = client
-                                .clear_scroll(ClearScrollParts::None)
-                                .body(clear_scroll_body)
-                                .send()
-                                .await;
-                        }
-                        SearchType::PointInTime => {
-                            debug!("Slice {}: Attempting to clean up PIT after error", slice_id);
-                            let _ = client
-                                .close_point_in_time()
-                                .body(json!({ "id": id }))
-                                .send()
-                                .await;
-                        }
-                    }
+                    cleanup_search_context(&client, &search_type, &id, slice_id).await;
                     return Err(anyhow!(
                         "Slice {}: Search continuation error: {}",
                         slice_id,
@@ -429,24 +447,7 @@ pub fn spawn_retrieval_task(
             let next_response_bytes = match next_response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    // Attempt cleanup before returning the error
-                    match search_type {
-                        SearchType::Scroll => {
-                            let clear_scroll_body = json!({ "scroll_id": [id.clone()] });
-                            let _ = client
-                                .clear_scroll(ClearScrollParts::None)
-                                .body(clear_scroll_body)
-                                .send()
-                                .await;
-                        }
-                        SearchType::PointInTime => {
-                            let _ = client
-                                .close_point_in_time()
-                                .body(json!({ "id": id }))
-                                .send()
-                                .await;
-                        }
-                    }
+                    cleanup_search_context(&client, &search_type, &id, slice_id).await;
                     return Err(anyhow!(
                         "Slice {}: Failed to read continuation response bytes: {}",
                         slice_id,
@@ -465,24 +466,7 @@ pub fn spawn_retrieval_task(
             let next_response_json: Value = match sonic_rs::from_slice(&next_response_bytes) {
                 Ok(json) => json,
                 Err(e) => {
-                    // Attempt cleanup before returning the error
-                    match search_type {
-                        SearchType::Scroll => {
-                            let clear_scroll_body = json!({ "scroll_id": [id.clone()] });
-                            let _ = client
-                                .clear_scroll(ClearScrollParts::None)
-                                .body(clear_scroll_body)
-                                .send()
-                                .await;
-                        }
-                        SearchType::PointInTime => {
-                            let _ = client
-                                .close_point_in_time()
-                                .body(json!({ "id": id }))
-                                .send()
-                                .await;
-                        }
-                    }
+                    cleanup_search_context(&client, &search_type, &id, slice_id).await;
                     return Err(anyhow!(
                         "Slice {}: Failed to parse continuation response from bytes: {}",
                         slice_id,
@@ -497,21 +481,14 @@ pub fn spawn_retrieval_task(
                 sonic_rs::to_string(&next_response_json).unwrap_or_default()
             );
 
+            // Refresh the search identifier before any early exit so cleanup uses the latest value.
+            refresh_search_id(&search_type, &next_response_json, &mut id);
+
             // Check if we have any hits
             let hits = next_response_json["hits"]["hits"].as_array();
             if hits.map_or(true, |h| h.is_empty()) {
                 info!("Search finished for slice {}, no more documents.", slice_id);
                 break; // No more hits
-            }
-
-            // For PIT search, update the PIT ID from the response
-            // IMPORTANT: The open point in time request and each subsequent search request can return
-            // different identifiers; always use the most recently received ID for the next search request.
-            if is_pit {
-                if let Some(new_pit_id) = next_response_json.get(&"pit_id").as_str() {
-                    debug!("Slice {}: Updating PIT ID to {}", slice_id, new_pit_id);
-                    id = new_pit_id.to_string();
-                }
             }
 
             // Update search_after with sort values from the last hit for next pagination
@@ -557,6 +534,7 @@ pub fn spawn_retrieval_task(
             // Send the batch to the next worker in round-robin fashion
             let batch = RetrievalMessage::Batch(Arc::new(next_response_json));
             if let Err(e) = worker_txs[next_worker].send(batch).await {
+                cleanup_search_context(&client, &search_type, &id, slice_id).await;
                 return Err(anyhow!(
                     "Failed to send batch to worker {} for slice {}: {}",
                     next_worker,
@@ -569,45 +547,7 @@ pub fn spawn_retrieval_task(
             next_worker = (next_worker + 1) % worker_txs.len();
         }
 
-        // Clean up search context at the end
-        match search_type {
-            SearchType::Scroll => {
-                debug!(
-                    "Slice {}: Cleaning up scroll context with ID {}",
-                    slice_id, id
-                );
-                let clear_scroll_body = json!({
-                    "scroll_id": [id]
-                });
-
-                let clear_response = client
-                    .clear_scroll(ClearScrollParts::None)
-                    .body(clear_scroll_body)
-                    .send()
-                    .await;
-
-                if let Err(e) = clear_response {
-                    warn!("Slice {}: Failed to clear scroll context: {}", slice_id, e);
-                } else {
-                    debug!("Slice {}: Successfully cleared scroll context", slice_id);
-                }
-            }
-            SearchType::PointInTime => {
-                let close_pit_body = json!({
-                    "id": id
-                });
-
-                let close_response = client
-                    .close_point_in_time()
-                    .body(close_pit_body)
-                    .send()
-                    .await;
-
-                if let Err(e) = close_response {
-                    warn!("Failed to close PIT for slice {}: {}", slice_id, e);
-                }
-            }
-        }
+        cleanup_search_context(&client, &search_type, &id, slice_id).await;
 
         info!(
             "Slice {} completed, retrieved {} documents",
@@ -615,4 +555,39 @@ pub fn spawn_retrieval_task(
         );
         Ok(slice_total_hits)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use sonic_rs::json;
+
+    #[test]
+    fn latest_pit_id_prefers_search_response_id() {
+        let response = json!({
+            "pit_id": "pit-from-search",
+            "hits": {
+                "hits": []
+            }
+        });
+
+        assert_eq!(
+            super::latest_pit_id(&response).as_deref(),
+            Some("pit-from-search")
+        );
+    }
+
+    #[test]
+    fn latest_scroll_id_reads_continuation_response_id() {
+        let response = json!({
+            "_scroll_id": "scroll-from-response",
+            "hits": {
+                "hits": []
+            }
+        });
+
+        assert_eq!(
+            super::latest_scroll_id(&response).as_deref(),
+            Some("scroll-from-response")
+        );
+    }
 }

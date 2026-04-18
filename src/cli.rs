@@ -70,7 +70,7 @@ pub struct Cli {
     pub debug: bool,
 
     /// Number of processing workers
-    #[clap(long, default_value = "4")]
+    #[clap(long, default_value_t = 4, value_parser = parse_non_zero_usize)]
     pub workers: usize,
 
     /// Number of parallel slices for the Elasticsearch sliced scroll API (0 disables sliced scroll)
@@ -78,10 +78,58 @@ pub struct Cli {
     pub slices: usize,
 
     /// Buffer size for channels
-    #[clap(long("bufferSize"), default_value = "16")]
+    #[clap(long("bufferSize"), default_value_t = 16, value_parser = parse_non_zero_usize)]
     pub buffer_size: usize,
 
     /// Enable Elasticsearch response compression (default: disabled)
     #[clap(long("esCompress"))]
     pub es_compress: bool,
+}
+
+fn parse_non_zero_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("'{value}' is not a valid positive integer"))?;
+
+    if parsed == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn rejects_zero_workers() {
+        let result = Cli::try_parse_from([
+            "elasticdump-rs",
+            "--input",
+            "http://localhost:9200/test_index",
+            "--output",
+            "$",
+            "--workers",
+            "0",
+        ]);
+
+        assert!(result.is_err(), "workers=0 should be rejected");
+    }
+
+    #[test]
+    fn rejects_zero_buffer_size() {
+        let result = Cli::try_parse_from([
+            "elasticdump-rs",
+            "--input",
+            "http://localhost:9200/test_index",
+            "--output",
+            "$",
+            "--bufferSize",
+            "0",
+        ]);
+
+        assert!(result.is_err(), "bufferSize=0 should be rejected");
+    }
 }

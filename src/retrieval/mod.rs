@@ -13,7 +13,6 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Instant;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::cli::Cli;
@@ -22,17 +21,15 @@ use self::messages::RetrievalMessage;
 use self::progress::setup_progress_bars;
 
 /// Main function to dump data from Elasticsearch
-pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
-    client: &Elasticsearch,
-    index: &str,
-    args: Cli,
-    writer: W,
-) -> Result<()> {
+pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result<()> {
     debug!("Starting data dump operation for index: {}", index);
     let start_time = Instant::now();
 
     // Prepare search body from user input
     let search_body = search_body::prepare_search_body(&args).await?;
+
+    // Create the output target only after input validation succeeds.
+    let output_target = crate::output::create_output_target(&args).await?;
 
     // Create channels for the pipeline
     let workers = args.workers;
@@ -183,22 +180,25 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
 
     // Output task
     let output_task = tokio::spawn(async move {
-        let mut writer = writer;
+        let mut output_target = output_target;
 
         // Process output as it comes in
         while let Some(processed) = processed_rx.recv().await {
             // Write the entire buffer from the processed batch
-            if let Err(e) = writer.write_all(&processed.buffer).await {
+            if let Err(e) = output_target.write_all(&processed.buffer).await {
+                output_target.abort().await;
                 return Err(anyhow::anyhow!("Failed to write batch buffer: {}", e));
             }
         }
 
-        // single flush after all batches are written
-        if let Err(e) = writer.flush().await {
+        if let Err(e) = output_target.flush().await {
+            output_target.abort().await;
             return Err(anyhow::anyhow!("Failed to flush writer: {}", e));
         }
-        Ok(())
+        Ok(output_target)
     });
+
+    let mut pipeline_error = None;
 
     // Wait for all retrieval tasks to complete and get total hits
     for task in retrieval_tasks {
@@ -208,11 +208,15 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
                     total_hits += slice_hits;
                 }
                 Err(e) => {
-                    return Err(anyhow::anyhow!("Retrieval task failed: {}", e));
+                    if pipeline_error.is_none() {
+                        pipeline_error = Some(anyhow::anyhow!("Retrieval task failed: {}", e));
+                    }
                 }
             },
             Err(e) => {
-                return Err(anyhow::anyhow!("Retrieval task panicked: {}", e));
+                if pipeline_error.is_none() {
+                    pipeline_error = Some(anyhow::anyhow!("Retrieval task panicked: {}", e));
+                }
             }
         }
     }
@@ -246,22 +250,49 @@ pub async fn dump_data<W: AsyncWrite + Unpin + Send + 'static>(
     for (i, task) in worker_tasks.into_iter().enumerate() {
         match task.await {
             Ok(Ok(())) => {} // Worker finished successfully
-            Ok(Err(e)) => return Err(anyhow::anyhow!("Worker {} processing failed: {}", i, e)),
-            Err(e) => return Err(anyhow::anyhow!("Worker {} task panicked: {}", i, e)),
+            Ok(Err(e)) => {
+                if pipeline_error.is_none() {
+                    pipeline_error =
+                        Some(anyhow::anyhow!("Worker {} processing failed: {}", i, e));
+                }
+            }
+            Err(e) => {
+                if pipeline_error.is_none() {
+                    pipeline_error = Some(anyhow::anyhow!("Worker {} task panicked: {}", i, e));
+                }
+            }
         }
     }
 
+    let mut completed_output_target = None;
+
     // Wait for output to finish
     match output_task.await {
-        Ok(result) => {
-            if let Err(e) = result {
-                return Err(anyhow::anyhow!("Output task failed: {}", e));
+        Ok(result) => match result {
+            Ok(output_target) => completed_output_target = Some(output_target),
+            Err(e) => {
+                if pipeline_error.is_none() {
+                    pipeline_error = Some(anyhow::anyhow!("Output task failed: {}", e));
+                }
+            }
+        },
+        Err(e) => {
+            if pipeline_error.is_none() {
+                pipeline_error = Some(anyhow::anyhow!("Output task panicked: {}", e));
             }
         }
-        Err(e) => {
-            return Err(anyhow::anyhow!("Output task panicked: {}", e));
-        }
     }
+
+    if let Some(error) = pipeline_error {
+        if let Some(output_target) = completed_output_target {
+            output_target.abort().await;
+        }
+        return Err(error);
+    }
+
+    let output_target = completed_output_target
+        .ok_or_else(|| anyhow::anyhow!("Output task completed without returning an output target"))?;
+    output_target.finalize().await?;
 
     let elapsed = start_time.elapsed();
     let count = processed_count.load(Ordering::Relaxed);

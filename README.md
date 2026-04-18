@@ -78,11 +78,13 @@ elasticdump-rs --input http://localhost:9200/my_index --output output.jsonl --se
 --overwrite          Overwrite output file if it exists
 --quiet              Suppress progress display
 --debug              Enable verbose logging
---workers            Number of worker threads for processing [default: 4]
+--workers            Number of worker threads for processing, must be >= 1 [default: 4]
 --slices             Number of parallel slices for Elasticsearch sliced scroll API [default: 0, disabled]
---bufferSize         Size of internal buffer for processing [default: 16]
+--bufferSize         Size of internal buffer for processing, must be >= 1 [default: 16]
 --esCompress         Enable Elasticsearch response compression (default: disabled)
 ```
+
+When `--output` points to a file, `elasticdump-rs` now stages writes to a temporary file and only replaces the destination after a successful dump. This prevents `--overwrite` from destroying an existing file when validation or retrieval fails early.
 
 ## Examples
 
