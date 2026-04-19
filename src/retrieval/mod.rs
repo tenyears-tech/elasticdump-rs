@@ -1,4 +1,5 @@
 mod messages;
+mod pit;
 mod progress;
 mod retrieval_task;
 mod search_body;
@@ -15,9 +16,10 @@ use std::sync::{
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, SearchType};
 
 use self::messages::RetrievalMessage;
+use self::pit::SharedPitCoordinator;
 use self::progress::setup_progress_bars;
 
 /// Main function to dump data from Elasticsearch
@@ -74,7 +76,14 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     // Setup for sliced search
     let use_sliced_scroll = slices > 0;
     let num_slices = if use_sliced_scroll { slices } else { 1 };
-    let mut total_hits = 0u64;
+    let mut estimated_total_hits = 0u64;
+    let mut total_hits_are_exact = true;
+
+    let shared_pit = if matches!(args.search_type, SearchType::PointInTime) {
+        Some(SharedPitCoordinator::open(client, index, &args.pit_keep_alive, num_slices).await?)
+    } else {
+        None
+    };
 
     // Clone references for retrieval tasks
     let client_ref = client.clone();
@@ -99,6 +108,7 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
             args.search_type.clone(),
             args.scroll.clone(),
             args.pit_keep_alive.clone(),
+            shared_pit.clone(),
             use_sliced_scroll,
             num_slices,
             Arc::clone(&total_hits_count),
@@ -205,7 +215,8 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         match task.await {
             Ok(result) => match result {
                 Ok(slice_hits) => {
-                    total_hits += slice_hits;
+                    estimated_total_hits += slice_hits.value;
+                    total_hits_are_exact &= slice_hits.is_exact;
                 }
                 Err(e) => {
                     if pipeline_error.is_none() {
@@ -221,21 +232,57 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         }
     }
 
+    if let Some(shared_pit) = &shared_pit {
+        let latest_id = shared_pit.latest_id().await;
+        let close_response = client
+            .close_point_in_time()
+            .body(sonic_rs::json!({ "id": latest_id }))
+            .send()
+            .await;
+
+        match close_response {
+            Ok(response) => {
+                if let Err(e) =
+                    retrieval_task::read_checked_response_bytes(response, 0, "PIT close").await
+                {
+                    if pipeline_error.is_none() {
+                        pipeline_error = Some(anyhow::anyhow!("Failed to close PIT: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                if pipeline_error.is_none() {
+                    pipeline_error = Some(anyhow::anyhow!("Failed to close PIT: {}", e));
+                }
+            }
+        }
+    }
+
     // Final update of progress bar total
     if let Some(ib) = &input_bar {
         debug!(
             "Input bar final length: {}, Total hits: {}",
             ib.length().unwrap_or(0),
-            total_hits
+            estimated_total_hits
         );
-        if ib.length().unwrap_or(0) != total_hits {
-            ib.set_length(total_hits);
+        let final_input_length = if total_hits_are_exact {
+            estimated_total_hits
+        } else {
+            estimated_total_hits.max(retrieved_count.load(Ordering::Relaxed))
+        };
+        if ib.length().unwrap_or(0) != final_input_length {
+            ib.set_length(final_input_length);
             ib.set_message("Retrieving...");
         }
     }
     if let Some(ob) = &output_bar {
-        if ob.length().unwrap_or(0) != total_hits {
-            ob.set_length(total_hits);
+        let final_output_length = if total_hits_are_exact {
+            estimated_total_hits
+        } else {
+            estimated_total_hits.max(processed_count.load(Ordering::Relaxed))
+        };
+        if ob.length().unwrap_or(0) != final_output_length {
+            ob.set_length(final_output_length);
         }
     }
 
@@ -252,8 +299,7 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
             Ok(Ok(())) => {} // Worker finished successfully
             Ok(Err(e)) => {
                 if pipeline_error.is_none() {
-                    pipeline_error =
-                        Some(anyhow::anyhow!("Worker {} processing failed: {}", i, e));
+                    pipeline_error = Some(anyhow::anyhow!("Worker {} processing failed: {}", i, e));
                 }
             }
             Err(e) => {
@@ -290,8 +336,9 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         return Err(error);
     }
 
-    let output_target = completed_output_target
-        .ok_or_else(|| anyhow::anyhow!("Output task completed without returning an output target"))?;
+    let output_target = completed_output_target.ok_or_else(|| {
+        anyhow::anyhow!("Output task completed without returning an output target")
+    })?;
     output_target.finalize().await?;
 
     let elapsed = start_time.elapsed();
@@ -302,15 +349,27 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     let docs_per_sec = count as f64 / elapsed_secs;
 
     // Finish progress bars
+    let retrieved_docs = retrieved_count.load(Ordering::Relaxed);
     let final_retrieved_bytes = retrieved_bytes.load(Ordering::Relaxed);
     let retrieved_bytes_per_sec = final_retrieved_bytes as f64 / elapsed_secs;
     if let Some(ib) = input_bar {
-        ib.finish_with_message(format!(
-            "Retrieved {} docs ({} @ {} /s)",
-            total_hits,
-            ByteSize(final_retrieved_bytes),
-            ByteSize(retrieved_bytes_per_sec as u64)
-        ));
+        let summary = if total_hits_are_exact {
+            format!(
+                "Retrieved {} docs ({} @ {} /s)",
+                retrieved_docs,
+                ByteSize(final_retrieved_bytes),
+                ByteSize(retrieved_bytes_per_sec as u64)
+            )
+        } else {
+            format!(
+                "Retrieved {} docs ({} @ {} /s, Elasticsearch reported total >= {})",
+                retrieved_docs,
+                ByteSize(final_retrieved_bytes),
+                ByteSize(retrieved_bytes_per_sec as u64),
+                estimated_total_hits
+            )
+        };
+        ib.finish_with_message(summary);
     }
     if let Some(ob) = output_bar {
         ob.finish_with_message(format!(

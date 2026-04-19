@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use bytesize::ByteSize;
 use elasticsearch::{
-    ClearScrollParts, Elasticsearch, OpenPointInTimeParts, ScrollParts, SearchParts,
+    ClearScrollParts, Elasticsearch, ScrollParts, SearchParts, http::response::Response,
 };
 use indicatif::ProgressBar;
 use log::{debug, info, warn};
@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::sync::mpsc::Sender;
 
-use super::messages::RetrievalMessage;
+use super::{messages::RetrievalMessage, pit::SharedPitCoordinator};
 use crate::cli::SearchType;
 
 fn latest_scroll_id(response: &Value) -> Option<String> {
@@ -37,6 +37,71 @@ fn refresh_search_id(search_type: &SearchType, response: &Value, id: &mut String
     }
 }
 
+pub(crate) async fn read_checked_response_bytes(
+    response: Response,
+    slice_id: usize,
+    operation: &str,
+) -> Result<Vec<u8>> {
+    let status = response.status_code();
+    let response_bytes = response.bytes().await.map_err(|e| {
+        anyhow!(
+            "Slice {}: Failed to read {} response bytes: {}",
+            slice_id,
+            operation,
+            e
+        )
+    })?;
+    let response_bytes = response_bytes.to_vec();
+
+    if !status.is_success() {
+        let response_body = String::from_utf8_lossy(&response_bytes);
+        return Err(anyhow!(
+            "Slice {}: Elasticsearch {} failed with HTTP {}: {}",
+            slice_id,
+            operation,
+            status.as_u16(),
+            response_body
+        ));
+    }
+
+    Ok(response_bytes)
+}
+
+fn ensure_pit_sort(search_body: &mut Value) {
+    let body = search_body
+        .as_object_mut()
+        .expect("PIT search body must be an object");
+    if !body.contains_key(&"sort") {
+        body.insert(&"sort", json!(["_shard_doc"]));
+    }
+}
+
+async fn abort_shared_pit(shared_pit: &Option<SharedPitCoordinator>, error: &anyhow::Error) {
+    if let Some(shared_pit) = shared_pit {
+        shared_pit.abort(error.to_string()).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TotalHitsEstimate {
+    pub(crate) value: u64,
+    pub(crate) is_exact: bool,
+}
+
+fn extract_total_hits_estimate(response: &Value) -> TotalHitsEstimate {
+    let value = response["hits"]["total"]["value"].as_u64().unwrap_or_else(|| {
+        response["hits"]["hits"]
+            .as_array()
+            .map_or(0, |hits| hits.len() as u64)
+    });
+    let relation = response["hits"]["total"]["relation"].as_str().unwrap_or("eq");
+
+    TotalHitsEstimate {
+        value,
+        is_exact: relation == "eq",
+    }
+}
+
 async fn cleanup_search_context(
     client: &Elasticsearch,
     search_type: &SearchType,
@@ -55,16 +120,7 @@ async fn cleanup_search_context(
                 warn!("Slice {}: Failed to clear scroll context: {}", slice_id, e);
             }
         }
-        SearchType::PointInTime => {
-            if let Err(e) = client
-                .close_point_in_time()
-                .body(json!({ "id": id }))
-                .send()
-                .await
-            {
-                warn!("Failed to close PIT for slice {}: {}", slice_id, e);
-            }
-        }
+        SearchType::PointInTime => {}
     }
 }
 
@@ -78,6 +134,7 @@ pub fn spawn_retrieval_task(
     search_type: SearchType,
     scroll_ttl: String,
     pit_keep_alive: String,
+    shared_pit: Option<SharedPitCoordinator>,
     use_sliced_scroll: bool,
     num_slices: usize,
     total_hits_count: Arc<AtomicU64>,
@@ -86,7 +143,7 @@ pub fn spawn_retrieval_task(
     retrieved_count: Arc<AtomicU64>,
     retrieved_bytes: Arc<AtomicU64>,
     start_time: Instant,
-) -> tokio::task::JoinHandle<Result<u64>> {
+) -> tokio::task::JoinHandle<Result<TotalHitsEstimate>> {
     // Setup for specific slice
     let mut search_body_obj = search_body.as_object_mut().unwrap().clone();
     if use_sliced_scroll {
@@ -102,6 +159,7 @@ pub fn spawn_retrieval_task(
 
     tokio::spawn(async move {
         debug!("Slice {}: Starting retrieval task", slice_id);
+        let mut pit_generation = None;
         // Initial search setup varies based on search type
         let response_result = match search_type {
             SearchType::Scroll => {
@@ -118,71 +176,32 @@ pub fn spawn_retrieval_task(
                     .await
             }
             SearchType::PointInTime => {
-                debug!(
-                    "Slice {}: Opening point in time with keep_alive {}",
-                    slice_id, &pit_keep_alive
-                );
-                // Open a Point in Time first
-                let pit_response = client
-                    .open_point_in_time(OpenPointInTimeParts::Index(&[&index]))
-                    .keep_alive(&pit_keep_alive)
-                    .send()
+                let lease = shared_pit
+                    .as_ref()
+                    .expect("PIT mode requires shared coordinator")
+                    .acquire()
                     .await;
+                pit_generation = Some(lease.generation);
 
-                let pit_id = match pit_response {
-                    Ok(resp) => {
-                        debug!("Slice {}: PIT opened successfully", slice_id);
-                        let pit_json: serde_json::Value = match resp.json().await {
-                            Ok(json) => json,
-                            Err(e) => {
-                                return Err(anyhow!(
-                                    "Slice {}: Failed to parse PIT open response: {}",
-                                    slice_id,
-                                    e
-                                ));
-                            }
-                        };
-
-                        match pit_json.get("id").and_then(serde_json::Value::as_str) {
-                            Some(id) => {
-                                debug!("Slice {}: Got PIT ID: {}", slice_id, id);
-                                id.to_string()
-                            }
-                            None => {
-                                return Err(anyhow!(
-                                    "Slice {}: No PIT ID found in response",
-                                    slice_id
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Slice {}: Failed to open PIT: {}", slice_id, e));
-                    }
-                };
-
-                // Add PIT to search body
-                search_body_obj.insert(
+                let mut initial_pit_body = json!(search_body_obj.clone());
+                ensure_pit_sort(&mut initial_pit_body);
+                initial_pit_body.as_object_mut().unwrap().insert(
                     &"pit",
                     json!({
-                        "id": pit_id,
+                        "id": lease.id,
                         "keep_alive": pit_keep_alive
                     }),
                 );
 
-                // Add default sort to make search_after work reliably
-                if !search_body_obj.contains_key(&"sort") {
-                    search_body_obj.insert(&"sort", json!(["_id"]));
-                }
                 debug!(
                     "Search body: {}",
-                    sonic_rs::to_string(&search_body_obj).unwrap_or_default()
+                    sonic_rs::to_string(&initial_pit_body).unwrap_or_default()
                 );
 
                 // Execute search with PIT ID
                 client
                     .search(SearchParts::None)
-                    .body(&search_body_obj)
+                    .body(&initial_pit_body)
                     .send()
                     .await
             }
@@ -194,25 +213,25 @@ pub fn spawn_retrieval_task(
                 r
             }
             Err(e) => {
-                return Err(anyhow!(
+                let error = anyhow!(
                     "Slice {}: Failed to initiate search: {} - this might indicate connection issues or invalid credentials",
                     slice_id,
                     e
-                ));
+                );
+                abort_shared_pit(&shared_pit, &error).await;
+                return Err(error);
             }
         };
 
         // Read bytes first to get accurate size
-        let response_bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Err(anyhow!(
-                    "Slice {}: Failed to read initial response bytes: {}",
-                    slice_id,
-                    e
-                ));
-            }
-        };
+        let response_bytes =
+            match read_checked_response_bytes(response, slice_id, "initial search").await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    abort_shared_pit(&shared_pit, &e).await;
+                    return Err(e);
+                }
+            };
 
         let initial_bytes = response_bytes.len() as u64;
         debug!(
@@ -230,11 +249,13 @@ pub fn spawn_retrieval_task(
                 json
             }
             Err(e) => {
-                return Err(anyhow!(
+                let error = anyhow!(
                     "Slice {}: Failed to parse initial response from bytes: {} - this might indicate malformed JSON or unexpected response format",
                     slice_id,
                     e
-                ));
+                );
+                abort_shared_pit(&shared_pit, &error).await;
+                return Err(error);
             }
         };
 
@@ -252,33 +273,22 @@ pub fn spawn_retrieval_task(
                 (scroll_id, false)
             }
             SearchType::PointInTime => {
-                // For PIT we already have the ID from the open_point_in_time call
-                // We need to extract it from search_body since we added it there
-                let latest_id = latest_pit_id(&search_response).or_else(|| {
-                    search_body_obj
-                        .get(&"pit")
-                        .and_then(|pit| pit.get(&"id"))
-                        .as_str()
-                        .map(|id| id.to_string())
-                });
+                let latest_id = latest_pit_id(&search_response);
                 (latest_id, true)
             }
         };
 
         // Get total hits for this slice
-        let slice_total_hits = search_response["hits"]["total"]["value"]
-            .as_u64()
-            .unwrap_or_else(|| {
-                search_response["hits"]["hits"]
-                    .as_array()
-                    .map_or(0, |h| h.len()) as u64
-            });
+        let slice_total_hits = extract_total_hits_estimate(&search_response);
 
-        debug!("Slice {}: Total hits: {}", slice_id, slice_total_hits);
+        debug!(
+            "Slice {}: Total hits estimate: {} (exact: {})",
+            slice_id, slice_total_hits.value, slice_total_hits.is_exact
+        );
 
         // Update the shared total hits counter
-        let previous_total = total_hits_count.fetch_add(slice_total_hits, Ordering::Relaxed);
-        let new_total = previous_total + slice_total_hits;
+        let previous_total = total_hits_count.fetch_add(slice_total_hits.value, Ordering::Relaxed);
+        let new_total = previous_total + slice_total_hits.value;
 
         // Update progress bar length if this is the last slice to report
         if let (Some(ib), Some(ob)) = (&input_bar, &output_bar) {
@@ -310,10 +320,18 @@ pub fn spawn_retrieval_task(
         }
 
         let next_worker = slice_id % worker_txs.len();
+        if is_pit {
+            shared_pit
+                .as_ref()
+                .expect("PIT mode requires shared coordinator")
+                .observe_returned_id(id_opt.as_deref())
+                .await;
+        }
         if let Err(e) = worker_txs[next_worker]
             .send(RetrievalMessage::Batch(response_data.clone()))
             .await
         {
+            abort_shared_pit(&shared_pit, &anyhow!(e.to_string())).await;
             if let Some(id) = &id_opt {
                 cleanup_search_context(&client, &search_type, id, slice_id).await;
             }
@@ -325,17 +343,6 @@ pub fn spawn_retrieval_task(
         }
 
         let mut next_worker = (next_worker + 1) % worker_txs.len();
-
-        // If no ID, return early
-        let mut id = match id_opt {
-            Some(id) => id,
-            None => {
-                return Err(anyhow!(
-                    "No ID found for slice {} to continue search",
-                    slice_id
-                ));
-            }
-        };
 
         // Continue searching for this slice
         let mut retrieved_hits = 0u64;
@@ -353,6 +360,64 @@ pub fn spawn_retrieval_task(
                 if let Some(sort) = last_hit.get("sort") {
                     search_after = Some(sort.clone());
                 }
+            }
+        }
+
+        let mut id = match (search_type.clone(), id_opt) {
+            (SearchType::Scroll, Some(id)) => id,
+            (SearchType::Scroll, None) => {
+                return Err(anyhow!(
+                    "No ID found for slice {} to continue search",
+                    slice_id
+                ));
+            }
+            (SearchType::PointInTime, Some(id)) => id,
+            (SearchType::PointInTime, None) => {
+                let lease = shared_pit
+                    .as_ref()
+                    .expect("PIT mode requires shared coordinator")
+                    .acquire()
+                    .await;
+                pit_generation = Some(lease.generation);
+                lease.id
+            }
+        };
+
+        if is_pit {
+            let shared_pit = shared_pit
+                .as_ref()
+                .expect("PIT mode requires shared coordinator");
+            let hits_are_empty = initial_hits == 0;
+            if let Err(e) = shared_pit
+                .complete_round(
+                    pit_generation.expect("PIT generation should be set"),
+                    latest_pit_id(response_data.as_ref()),
+                    hits_are_empty,
+                )
+                .await
+            {
+                abort_shared_pit(&Some(shared_pit.clone()), &e).await;
+                return Err(e);
+            }
+
+            if hits_are_empty {
+                info!("Search finished for slice {}, no more documents.", slice_id);
+                info!(
+                    "Slice {} completed, retrieved {} documents",
+                    slice_id, retrieved_hits
+                );
+                return Ok(slice_total_hits);
+            }
+
+            match shared_pit
+                .wait_for_generation(pit_generation.expect("PIT generation should be set") + 1)
+                .await
+            {
+                Ok(next_lease) => {
+                    pit_generation = Some(next_lease.generation);
+                    id = next_lease.id;
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -375,43 +440,23 @@ pub fn spawn_retrieval_task(
                 }
                 SearchType::PointInTime => {
                     debug!("Slice {}: Continuing PIT search with ID {}", slice_id, id);
-                    // For PIT, we need to create a new search body with:
-                    // 1. The PIT ID
-                    // 2. search_after from last result
-                    // 3. Any other search params (query, etc.)
-                    let mut next_pit_body = search_body_obj.clone();
-
-                    // Update the PIT ID in the search body
-                    if next_pit_body.contains_key(&"pit") {
-                        if let Some(pit_obj) = next_pit_body["pit"].as_object_mut() {
-                            pit_obj.insert(&"id", json!(id));
-                            debug!("Slice {}: Updated PIT ID in search body", slice_id);
-                        }
-                    } else {
-                        // If pit object doesn't exist, create it
-                        next_pit_body.insert(
-                            &"pit",
-                            json!({
-                                "id": id,
-                                "keep_alive": pit_keep_alive
-                            }),
-                        );
-                        debug!("Slice {}: Added PIT ID to search body", slice_id);
-                    }
-
-                    // Make sure we have a sort parameter (required for search_after)
-                    if !next_pit_body.contains_key(&"sort") {
-                        debug!(
-                            "Slice {}: Adding default sort by _id for PIT search",
-                            slice_id
-                        );
-                        next_pit_body.insert(&"sort", json!(["_id"]));
-                    }
+                    let mut next_pit_body = json!(search_body_obj.clone());
+                    ensure_pit_sort(&mut next_pit_body);
+                    next_pit_body.as_object_mut().unwrap().insert(
+                        &"pit",
+                        json!({
+                            "id": id,
+                            "keep_alive": pit_keep_alive
+                        }),
+                    );
 
                     // Add search_after from the last response if available
                     if let Some(sort_values) = &search_after {
                         debug!("Slice {}: Using search_after from last result", slice_id);
-                        next_pit_body.insert(&"search_after", sort_values.clone());
+                        next_pit_body
+                            .as_object_mut()
+                            .unwrap()
+                            .insert(&"search_after", sort_values.clone());
                     } else {
                         debug!("Slice {}: No search_after values available", slice_id);
                     }
@@ -434,27 +479,25 @@ pub fn spawn_retrieval_task(
                     res
                 }
                 Err(e) => {
+                    let error = anyhow!("Slice {}: Search continuation error: {}", slice_id, e);
+                    abort_shared_pit(&shared_pit, &error).await;
                     cleanup_search_context(&client, &search_type, &id, slice_id).await;
-                    return Err(anyhow!(
-                        "Slice {}: Search continuation error: {}",
-                        slice_id,
-                        e
-                    ));
+                    return Err(error);
                 }
             };
 
             // Read bytes first to get accurate size
-            let next_response_bytes = match next_response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    cleanup_search_context(&client, &search_type, &id, slice_id).await;
-                    return Err(anyhow!(
-                        "Slice {}: Failed to read continuation response bytes: {}",
-                        slice_id,
-                        e
-                    ));
-                }
-            };
+            let next_response_bytes =
+                match read_checked_response_bytes(next_response, slice_id, "continuation search")
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        abort_shared_pit(&shared_pit, &e).await;
+                        cleanup_search_context(&client, &search_type, &id, slice_id).await;
+                        return Err(e);
+                    }
+                };
 
             let batch_bytes = next_response_bytes.len() as u64;
             debug!(
@@ -466,12 +509,14 @@ pub fn spawn_retrieval_task(
             let next_response_json: Value = match sonic_rs::from_slice(&next_response_bytes) {
                 Ok(json) => json,
                 Err(e) => {
-                    cleanup_search_context(&client, &search_type, &id, slice_id).await;
-                    return Err(anyhow!(
+                    let error = anyhow!(
                         "Slice {}: Failed to parse continuation response from bytes: {}",
                         slice_id,
                         e
-                    ));
+                    );
+                    abort_shared_pit(&shared_pit, &error).await;
+                    cleanup_search_context(&client, &search_type, &id, slice_id).await;
+                    return Err(error);
                 }
             };
 
@@ -481,18 +526,17 @@ pub fn spawn_retrieval_task(
                 sonic_rs::to_string(&next_response_json).unwrap_or_default()
             );
 
-            // Refresh the search identifier before any early exit so cleanup uses the latest value.
-            refresh_search_id(&search_type, &next_response_json, &mut id);
+            if !is_pit {
+                // Refresh the search identifier before any early exit so cleanup uses the latest value.
+                refresh_search_id(&search_type, &next_response_json, &mut id);
+            }
 
             // Check if we have any hits
             let hits = next_response_json["hits"]["hits"].as_array();
-            if hits.map_or(true, |h| h.is_empty()) {
-                info!("Search finished for slice {}, no more documents.", slice_id);
-                break; // No more hits
-            }
+            let hits_are_empty = hits.map_or(true, |h| h.is_empty());
 
             // Update search_after with sort values from the last hit for next pagination
-            if is_pit {
+            if is_pit && !hits_are_empty {
                 if let Some(hits_array) = hits {
                     if let Some(last_hit) = hits_array.last() {
                         debug!(
@@ -531,9 +575,23 @@ pub fn spawn_retrieval_task(
                 ));
             }
 
+            let returned_pit_id = if is_pit {
+                latest_pit_id(&next_response_json)
+            } else {
+                None
+            };
+            if is_pit {
+                shared_pit
+                    .as_ref()
+                    .expect("PIT mode requires shared coordinator")
+                    .observe_returned_id(returned_pit_id.as_deref())
+                    .await;
+            }
+
             // Send the batch to the next worker in round-robin fashion
             let batch = RetrievalMessage::Batch(Arc::new(next_response_json));
             if let Err(e) = worker_txs[next_worker].send(batch).await {
+                abort_shared_pit(&shared_pit, &anyhow!(e.to_string())).await;
                 cleanup_search_context(&client, &search_type, &id, slice_id).await;
                 return Err(anyhow!(
                     "Failed to send batch to worker {} for slice {}: {}",
@@ -545,6 +603,42 @@ pub fn spawn_retrieval_task(
 
             // Move to the next worker
             next_worker = (next_worker + 1) % worker_txs.len();
+
+            if is_pit {
+                let shared_pit = shared_pit
+                    .as_ref()
+                    .expect("PIT mode requires shared coordinator");
+                if let Err(e) = shared_pit
+                    .complete_round(
+                        pit_generation.expect("PIT generation should be set"),
+                        returned_pit_id,
+                        hits_are_empty,
+                    )
+                    .await
+                {
+                    abort_shared_pit(&Some(shared_pit.clone()), &e).await;
+                    return Err(e);
+                }
+
+                if hits_are_empty {
+                    info!("Search finished for slice {}, no more documents.", slice_id);
+                    break;
+                }
+
+                match shared_pit
+                    .wait_for_generation(pit_generation.expect("PIT generation should be set") + 1)
+                    .await
+                {
+                    Ok(next_lease) => {
+                        pit_generation = Some(next_lease.generation);
+                        id = next_lease.id;
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else if hits_are_empty {
+                info!("Search finished for slice {}, no more documents.", slice_id);
+                break;
+            }
         }
 
         cleanup_search_context(&client, &search_type, &id, slice_id).await;
@@ -588,6 +682,69 @@ mod tests {
         assert_eq!(
             super::latest_scroll_id(&response).as_deref(),
             Some("scroll-from-response")
+        );
+    }
+
+    #[test]
+    fn ensure_pit_sort_sets_shard_doc_when_missing() {
+        let mut body = json!({
+            "query": { "match_all": {} },
+            "pit": { "id": "pit-id", "keep_alive": "1m" }
+        });
+
+        super::ensure_pit_sort(&mut body);
+
+        assert_eq!(body["sort"], json!(["_shard_doc"]));
+    }
+
+    #[test]
+    fn ensure_pit_sort_preserves_user_supplied_sort() {
+        let mut body = json!({
+            "query": { "match_all": {} },
+            "pit": { "id": "pit-id", "keep_alive": "1m" },
+            "sort": [{ "created_at": "asc" }]
+        });
+
+        super::ensure_pit_sort(&mut body);
+
+        assert_eq!(body["sort"], json!([{ "created_at": "asc" }]));
+    }
+
+    #[test]
+    fn extract_total_hits_estimate_marks_gte_as_inexact() {
+        let response = json!({
+            "hits": {
+                "total": { "value": 10000, "relation": "gte" },
+                "hits": []
+            }
+        });
+
+        let estimate = super::extract_total_hits_estimate(&response);
+        assert_eq!(
+            estimate,
+            super::TotalHitsEstimate {
+                value: 10000,
+                is_exact: false,
+            }
+        );
+    }
+
+    #[test]
+    fn extract_total_hits_estimate_marks_eq_as_exact() {
+        let response = json!({
+            "hits": {
+                "total": { "value": 42, "relation": "eq" },
+                "hits": []
+            }
+        });
+
+        let estimate = super::extract_total_hits_estimate(&response);
+        assert_eq!(
+            estimate,
+            super::TotalHitsEstimate {
+                value: 42,
+                is_exact: true,
+            }
         );
     }
 }

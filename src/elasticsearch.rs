@@ -9,35 +9,56 @@ use url::Url;
 
 use crate::cli::Cli;
 
+fn path_segments_without_empty(url: &Url) -> Vec<&str> {
+    url.path_segments()
+        .map(|segments| segments.filter(|segment| !segment.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 /// Parse the input URL and extract host URL, index name, and auth credentials
 pub fn parse_input_url(args: &Cli) -> Result<(Url, String, Option<String>, Option<String>)> {
-    // Parse input URL
     let input_url = Url::parse(&args.input).context("Failed to parse input URL")?;
     log::debug!("Parsed input URL: {}", input_url);
 
-    // --- Host Extraction ---
-    let host_str = input_url.host_str().unwrap_or("localhost");
-    let port_str = input_url
-        .port()
-        .map_or("".to_string(), |p| format!(":{}", p));
-    let host_url_str = format!("{}://{}{}", input_url.scheme(), host_str, port_str);
-    let host_url = Url::parse(&host_url_str)?;
-    log::debug!("Extracted host URL: {}", host_url);
-
-    // --- Index Extraction ---
-    let mut path_segments = input_url
-        .path_segments()
-        .map(|segments| segments.collect::<Vec<_>>())
-        .unwrap_or_default();
-    path_segments.retain(|segment| !segment.is_empty());
-    if path_segments.is_empty() {
+    let segments = path_segments_without_empty(&input_url);
+    if segments.is_empty() {
         return Err(anyhow!("No index specified in the input URL path"));
     }
-    let index = path_segments[0].to_string();
+
+    let normalized_segments = match segments.last().copied() {
+        Some("_search") if segments.len() >= 2 => &segments[..segments.len() - 1],
+        _ => &segments[..],
+    };
+
+    let index = normalized_segments
+        .last()
+        .ok_or_else(|| anyhow!("No index specified in the input URL path"))?;
+    if index.starts_with('_') {
+        return Err(anyhow!(
+            "Input URL must point to an index root, not an Elasticsearch API endpoint"
+        ));
+    }
+
+    let mut host_url = input_url.clone();
+    host_url
+        .set_username("")
+        .map_err(|_| anyhow!("Failed to clear username from input URL"))?;
+    host_url
+        .set_password(None)
+        .map_err(|_| anyhow!("Failed to clear password from input URL"))?;
+    host_url.set_query(None);
+    host_url.set_fragment(None);
+
+    let base_path = if normalized_segments.len() == 1 {
+        "/".to_string()
+    } else {
+        format!("/{}/", normalized_segments[..normalized_segments.len() - 1].join("/"))
+    };
+    host_url.set_path(&base_path);
+
+    log::debug!("Extracted host URL: {}", host_url);
     log::debug!("Using index: {}", index);
 
-    // --- Authentication ---
-    // Priority: Flags > URL > None
     let url_username = input_url.username();
     let url_password = input_url.password();
 
@@ -59,7 +80,7 @@ pub fn parse_input_url(args: &Cli) -> Result<(Url, String, Option<String>, Optio
         .or(url_password)
         .map(|s| s.to_string());
 
-    Ok((host_url, index, auth_username, auth_password))
+    Ok((host_url, index.to_string(), auth_username, auth_password))
 }
 
 /// Create and configure the Elasticsearch client
@@ -112,4 +133,60 @@ pub fn create_client(
 
     log::debug!("Elasticsearch client created successfully");
     Ok(Elasticsearch::new(transport))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::parse_input_url;
+    use crate::cli::Cli;
+
+    fn minimal_cli() -> Cli {
+        Cli::parse_from([
+            "elasticdump-rs",
+            "--input",
+            "http://localhost:9200/placeholder",
+            "--output",
+            "$",
+        ])
+    }
+
+    #[test]
+    fn parse_input_url_preserves_base_path() {
+        let args = Cli {
+            input: "https://example.com/es-proxy/my_index".into(),
+            output: "$".into(),
+            ..minimal_cli()
+        };
+
+        let (host_url, index, _, _) = parse_input_url(&args).unwrap();
+        assert_eq!(host_url.as_str(), "https://example.com/es-proxy/");
+        assert_eq!(index, "my_index");
+    }
+
+    #[test]
+    fn parse_input_url_normalizes_search_suffix() {
+        let args = Cli {
+            input: "https://example.com/es-proxy/my_index/_search".into(),
+            output: "$".into(),
+            ..minimal_cli()
+        };
+
+        let (host_url, index, _, _) = parse_input_url(&args).unwrap();
+        assert_eq!(host_url.as_str(), "https://example.com/es-proxy/");
+        assert_eq!(index, "my_index");
+    }
+
+    #[test]
+    fn parse_input_url_rejects_other_endpoint_suffixes() {
+        let args = Cli {
+            input: "https://example.com/es-proxy/my_index/_count".into(),
+            output: "$".into(),
+            ..minimal_cli()
+        };
+
+        let error = parse_input_url(&args).unwrap_err().to_string();
+        assert!(error.contains("index root"));
+    }
 }

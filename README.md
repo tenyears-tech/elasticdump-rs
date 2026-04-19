@@ -13,6 +13,7 @@ A blazing fast Elasticsearch data dumper written in Rust. It implements a subset
 - Progress bar with throughput display
 - Customizable scroll size and timeout
 - Support for both Scroll API and Point in Time API for efficient data retrieval
+- Shared PIT coordination across slices so sliced PIT keeps one generation-aligned PIT ID in flight
 - Support for filtering documents with custom query
 - Ability to output to stdout for piping to other tools
 - Multi-threaded processing for optimal performance
@@ -86,6 +87,12 @@ elasticdump-rs --input http://localhost:9200/my_index --output output.jsonl --se
 
 When `--output` points to a file, `elasticdump-rs` now stages writes to a temporary file and only replaces the destination after a successful dump. This prevents `--overwrite` from destroying an existing file when validation or retrieval fails early.
 
+`--input` may point to either the index root URL or a trailing `/_search` URL. Proxy/base-path prefixes are preserved, but other endpoint URLs such as `/my_index/_count` are rejected.
+
+When `--searchType pit` is used without an explicit `sort`, `elasticdump-rs` now defaults to `["_shard_doc"]`, which is the recommended fast path for full PIT dumps. If you provide your own `sort`, it is preserved unchanged.
+
+When `--searchType pit` is combined with `--slices`, `elasticdump-rs` now coordinates one shared PIT per generation across all active slices. Each active slice uses the same PIT ID for a generation, the coordinator advances only after every active slice reports back, and finished slices drop out of later generations. The final PIT is closed once after retrieval completes.
+
 ## Examples
 
 ```bash
@@ -145,11 +152,11 @@ The project includes both unit tests and integration tests:
 # Run unit tests
 cargo test
 
-# Run integration tests (requires a running Elasticsearch instance)
+# Run the default integration suite (requires a running Elasticsearch instance)
 cargo test --test integration_test
 
-# Run performance benchmark test
-cargo test test_performance_benchmark -- --test integration_test --nocapture
+# Run the benchmark-style integration tests explicitly
+cargo test --test integration_test -- --ignored --nocapture
 
 # Run large-scale performance test (requires significant resources)
 cargo test --features large_scale_test test_large_scale_performance -- --test integration_test --nocapture

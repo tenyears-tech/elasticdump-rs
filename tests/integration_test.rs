@@ -12,7 +12,6 @@ use std::{
     io::{BufRead, BufReader},
     process::{Command, Stdio},
     sync::atomic::{AtomicU32, Ordering},
-    thread,
     time::Duration,
 };
 use url::Url;
@@ -55,7 +54,7 @@ async fn wait_for_elasticsearch() -> Result<()> {
                     ));
                 }
                 println!("Connection failed: {}. Retrying in 2 seconds...", err);
-                thread::sleep(Duration::from_secs(2));
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     }
@@ -268,9 +267,12 @@ async fn setup_test_data(test_index: &str) -> Result<()> {
 }
 
 // Run the elasticdump-rs command
+fn elasticdump_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_elasticdump-rs")
+}
+
 fn run_elasticdump_command(args: &[&str]) -> Result<()> {
-    let status = Command::new("cargo")
-        .args(["run", "--"])
+    let status = Command::new(elasticdump_binary())
         .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -279,6 +281,13 @@ fn run_elasticdump_command(args: &[&str]) -> Result<()> {
     assert!(status.success(), "elasticdump-rs command failed");
 
     Ok(())
+}
+
+fn run_elasticdump_command_capture(args: &[&str]) -> Result<std::process::Output> {
+    Command::new(elasticdump_binary())
+        .args(args)
+        .output()
+        .map_err(Into::into)
 }
 
 // Cleanup test data
@@ -421,8 +430,7 @@ async fn test_stdout_output() -> Result<()> {
     setup_test_data(&test_index).await?;
 
     // Run elasticdump-rs with output to stdout, captured to a file
-    let output = Command::new("cargo")
-        .args(["run", "--"])
+    let output = Command::new(elasticdump_binary())
         .args(&[
             "--input",
             &format!("{}/{}", ES_URL, test_index),
@@ -609,8 +617,7 @@ async fn test_overwrite_flag() -> Result<()> {
 
     // Run dump without --overwrite (should fail or do nothing depending on implementation)
     // We expect our implementation with OpenOptions::create_new to fail here
-    let status = Command::new("cargo")
-        .args(["run", "--"])
+    let status = Command::new(elasticdump_binary())
         .args(&[
             "--input",
             &format!("{}/{}", ES_URL, test_index),
@@ -652,8 +659,7 @@ async fn test_overwrite_preserves_existing_file_on_invalid_search_body() -> Resu
     let original_content = "keep me intact\n";
     std::fs::write(output_file, original_content)?;
 
-    let output = Command::new("cargo")
-        .args(["run", "--"])
+    let output = Command::new(elasticdump_binary())
         .args(&[
             "--input",
             "http://localhost:9200/nonexistent_index",
@@ -682,6 +688,71 @@ async fn test_overwrite_preserves_existing_file_on_invalid_search_body() -> Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn test_reports_index_not_found_error_for_scroll() -> Result<()> {
+    let output = run_elasticdump_command_capture(&[
+        "--input",
+        &format!("{}/{}", ES_URL, "definitely_missing_index_review_probe"),
+        "--output",
+        "$",
+        "--quiet",
+    ])?;
+
+    assert!(
+        !output.status.success(),
+        "Command should fail for a missing index"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("index_not_found_exception"),
+        "stderr should include the Elasticsearch error type, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("definitely_missing_index_review_probe"),
+        "stderr should include the missing index name, got: {}",
+        stderr
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reports_index_not_found_error_for_pit() -> Result<()> {
+    let output = run_elasticdump_command_capture(&[
+        "--input",
+        &format!("{}/{}", ES_URL, "definitely_missing_index_review_probe"),
+        "--output",
+        "$",
+        "--searchType",
+        "pit",
+        "--pitKeepAlive",
+        "1m",
+        "--quiet",
+    ])?;
+
+    assert!(
+        !output.status.success(),
+        "Command should fail for a missing index"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("index_not_found_exception"),
+        "stderr should include the Elasticsearch error type, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("definitely_missing_index_review_probe"),
+        "stderr should include the missing index name, got: {}",
+        stderr
+    );
+
+    Ok(())
+}
+
+#[ignore = "benchmark-style integration test"]
 #[tokio::test]
 async fn test_performance_benchmark() -> Result<()> {
     // Get a unique test index and output file
@@ -955,6 +1026,7 @@ async fn test_sliced_scroll_with_query() -> Result<()> {
     Ok(())
 }
 
+#[ignore = "benchmark-style integration test"]
 #[tokio::test]
 async fn test_slices_performance_comparison() -> Result<()> {
     let test_index = get_unique_test_index();
@@ -1258,6 +1330,7 @@ async fn test_sliced_pit() -> Result<()> {
     Ok(())
 }
 
+#[ignore = "benchmark-style integration test"]
 #[tokio::test]
 async fn test_compare_scroll_vs_pit() -> Result<()> {
     // Get a unique test index and output files
