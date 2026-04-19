@@ -18,6 +18,10 @@ A blazing fast Elasticsearch data dumper written in Rust. It implements a subset
 - Ability to output to stdout for piping to other tools
 - Multi-threaded processing for optimal performance
 
+## Platform Support
+
+`elasticdump-rs` currently supports Unix-like platforms only. Windows is not supported in this release train.
+
 ## Installation
 
 ```bash
@@ -93,6 +97,8 @@ When `--searchType pit` is used without an explicit `sort`, `elasticdump-rs` now
 
 When `--searchType pit` is combined with `--slices`, `elasticdump-rs` now coordinates one shared PIT per generation across all active slices. Each active slice uses the same PIT ID for a generation, the coordinator advances only after every active slice reports back, and finished slices drop out of later generations. The final PIT is closed once after retrieval completes.
 
+When `--workers` is greater than `1`, batches are processed and written as workers finish. Dump output is therefore not guaranteed to preserve Elasticsearch document order, even when the search request uses `sort`.
+
 ## Examples
 
 ```bash
@@ -157,6 +163,9 @@ cargo test --test integration_test
 
 # Run the benchmark-style integration tests explicitly
 cargo test --test integration_test -- --ignored --nocapture
+
+# Run the scroll-vs-PIT comparison benchmark explicitly
+cargo test --test integration_test test_compare_scroll_vs_pit -- --ignored --nocapture
 
 # Run large-scale performance test (requires significant resources)
 cargo test --features large_scale_test test_large_scale_performance -- --test integration_test --nocapture

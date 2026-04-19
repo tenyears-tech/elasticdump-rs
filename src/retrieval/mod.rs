@@ -1,8 +1,10 @@
 mod context;
 mod messages;
 mod pit;
+mod pit_search;
 mod progress;
 mod retrieval_task;
+mod scroll;
 mod search_body;
 mod slice_state;
 
