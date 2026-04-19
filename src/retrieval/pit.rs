@@ -1,7 +1,16 @@
 use anyhow::{Result, anyhow};
 use elasticsearch::{Elasticsearch, OpenPointInTimeParts};
+use sonic_rs::JsonValueTrait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
+
+fn parse_pit_open_id(body: &[u8]) -> Result<String> {
+    let json: sonic_rs::Value = sonic_rs::from_slice(body)?;
+    json["id"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("No PIT ID found in response"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PitLease {
@@ -41,11 +50,7 @@ impl SharedPitCoordinator {
             .await?;
         let body =
             super::retrieval_task::read_checked_response_bytes(response, 0, "PIT open").await?;
-        let json: serde_json::Value = serde_json::from_slice(&body)?;
-        let id = json["id"]
-            .as_str()
-            .ok_or_else(|| anyhow!("No PIT ID found in response"))?
-            .to_string();
+        let id = parse_pit_open_id(&body)?;
 
         Ok(Self::new_for_test(id, active_slices))
     }
@@ -169,7 +174,23 @@ impl SharedPitCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_pit_open_id;
     use std::time::Duration;
+
+    #[test]
+    fn parse_pit_open_id_reads_id_from_sonic_response() {
+        let body = br#"{"id":"pit-123","creation_time":12345}"#;
+
+        assert_eq!(parse_pit_open_id(body).unwrap(), "pit-123");
+    }
+
+    #[test]
+    fn parse_pit_open_id_rejects_missing_id() {
+        let body = br#"{"creation_time":12345}"#;
+
+        let error = parse_pit_open_id(body).unwrap_err().to_string();
+        assert!(error.contains("No PIT ID found in response"));
+    }
 
     #[tokio::test]
     async fn shared_pit_advances_generation_after_all_active_slices_report() {
