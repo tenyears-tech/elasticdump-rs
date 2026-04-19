@@ -3,19 +3,14 @@ use bytesize::ByteSize;
 use elasticsearch::{
     ClearScrollParts, Elasticsearch, ScrollParts, SearchParts, http::response::Response,
 };
-use indicatif::ProgressBar;
 use log::{debug, info, warn};
 use sonic_rs::{JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value, json};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Instant,
-};
-use tokio::sync::mpsc::Sender;
+use std::sync::{Arc, atomic::Ordering};
 
-use super::{messages::RetrievalMessage, pit::SharedPitCoordinator};
+use super::{
+    context::RetrievalContext, messages::RetrievalMessage, pit::SharedPitCoordinator,
+    slice_state::SliceState,
+};
 use crate::cli::SearchType;
 
 fn latest_scroll_id(response: &Value) -> Option<String> {
@@ -89,17 +84,82 @@ pub(crate) struct TotalHitsEstimate {
 }
 
 fn extract_total_hits_estimate(response: &Value) -> TotalHitsEstimate {
-    let value = response["hits"]["total"]["value"].as_u64().unwrap_or_else(|| {
-        response["hits"]["hits"]
-            .as_array()
-            .map_or(0, |hits| hits.len() as u64)
-    });
-    let relation = response["hits"]["total"]["relation"].as_str().unwrap_or("eq");
+    let value = response["hits"]["total"]["value"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            response["hits"]["hits"]
+                .as_array()
+                .map_or(0, |hits| hits.len() as u64)
+        });
+    let relation = response["hits"]["total"]["relation"]
+        .as_str()
+        .unwrap_or("eq");
 
     TotalHitsEstimate {
         value,
         is_exact: relation == "eq",
     }
+}
+
+pub(crate) fn record_total_hits(
+    ctx: &RetrievalContext,
+    estimate: TotalHitsEstimate,
+) -> TotalHitsEstimate {
+    let previous_total = ctx
+        .total_hits_count
+        .fetch_add(estimate.value, Ordering::Relaxed);
+    let new_total = previous_total + estimate.value;
+
+    if let (Some(input_bar), Some(output_bar)) = (&ctx.input_bar, &ctx.output_bar) {
+        input_bar.set_length(new_total);
+        output_bar.set_length(new_total);
+    }
+
+    estimate
+}
+
+pub(crate) async fn dispatch_response_batch(
+    ctx: &RetrievalContext,
+    state: &mut SliceState,
+    response: Arc<Value>,
+    batch_bytes: u64,
+) -> Result<bool> {
+    let hits = response["hits"]["hits"].as_array();
+    let hits_are_empty = hits.is_none_or(|items| items.is_empty());
+    let batch_size = hits.map_or(0, |items| items.len() as u64);
+
+    state.retrieved_hits += batch_size;
+    let current_retrieved =
+        ctx.retrieved_count.fetch_add(batch_size, Ordering::Relaxed) + batch_size;
+    let current_bytes = ctx
+        .retrieved_bytes
+        .fetch_add(batch_bytes, Ordering::Relaxed)
+        + batch_bytes;
+
+    if let Some(input_bar) = &ctx.input_bar {
+        input_bar.set_position(current_retrieved);
+        let elapsed_secs = ctx.start_time.elapsed().as_secs_f64().max(1e-6);
+        input_bar.set_message(format!(
+            "{} @ {} /s",
+            ByteSize(current_bytes),
+            ByteSize((current_bytes as f64 / elapsed_secs) as u64)
+        ));
+    }
+
+    let worker = state.dispatch_worker(ctx.worker_txs.len());
+    ctx.worker_txs[worker]
+        .send(RetrievalMessage::Batch(response))
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "Failed to send batch to worker {} for slice {}: {}",
+                worker,
+                state.slice_id,
+                error
+            )
+        })?;
+
+    Ok(hits_are_empty)
 }
 
 async fn cleanup_search_context(
@@ -126,52 +186,28 @@ async fn cleanup_search_context(
 
 /// Spawn a retrieval task for a specific slice
 pub fn spawn_retrieval_task(
-    slice_id: usize,
-    client: Elasticsearch,
-    index: String,
-    worker_txs: Vec<Sender<RetrievalMessage>>,
-    mut search_body: Value,
+    ctx: RetrievalContext,
+    mut state: SliceState,
     search_type: SearchType,
     scroll_ttl: String,
     pit_keep_alive: String,
     shared_pit: Option<SharedPitCoordinator>,
-    use_sliced_scroll: bool,
-    num_slices: usize,
-    total_hits_count: Arc<AtomicU64>,
-    input_bar: Option<ProgressBar>,
-    output_bar: Option<ProgressBar>,
-    retrieved_count: Arc<AtomicU64>,
-    retrieved_bytes: Arc<AtomicU64>,
-    start_time: Instant,
 ) -> tokio::task::JoinHandle<Result<TotalHitsEstimate>> {
-    // Setup for specific slice
-    let mut search_body_obj = search_body.as_object_mut().unwrap().clone();
-    if use_sliced_scroll {
-        search_body_obj.insert(
-            &"slice",
-            json!({
-                "id": slice_id,
-                "max": num_slices
-            }),
-        );
-        info!("Starting slice {}/{}", slice_id + 1, num_slices);
-    }
-
     tokio::spawn(async move {
-        debug!("Slice {}: Starting retrieval task", slice_id);
-        let mut pit_generation = None;
+        debug!("Slice {}: Starting retrieval task", state.slice_id);
+
         // Initial search setup varies based on search type
         let response_result = match search_type {
             SearchType::Scroll => {
                 debug!(
                     "Slice {}: Initiating scroll search with size {}",
-                    slice_id, search_body_obj["size"]
+                    state.slice_id, state.search_body["size"]
                 );
                 // Use Scroll API
-                client
-                    .search(SearchParts::Index(&[&index]))
+                ctx.client
+                    .search(SearchParts::Index(&[ctx.index.as_ref()]))
                     .scroll(&scroll_ttl)
-                    .body(&search_body_obj)
+                    .body(&state.search_body)
                     .send()
                     .await
             }
@@ -181,9 +217,9 @@ pub fn spawn_retrieval_task(
                     .expect("PIT mode requires shared coordinator")
                     .acquire()
                     .await;
-                pit_generation = Some(lease.generation);
+                state.pit_generation = Some(lease.generation);
 
-                let mut initial_pit_body = json!(search_body_obj.clone());
+                let mut initial_pit_body = state.search_body.clone();
                 ensure_pit_sort(&mut initial_pit_body);
                 initial_pit_body.as_object_mut().unwrap().insert(
                     &"pit",
@@ -199,7 +235,7 @@ pub fn spawn_retrieval_task(
                 );
 
                 // Execute search with PIT ID
-                client
+                ctx.client
                     .search(SearchParts::None)
                     .body(&initial_pit_body)
                     .send()
@@ -209,13 +245,16 @@ pub fn spawn_retrieval_task(
 
         let response = match response_result {
             Ok(r) => {
-                debug!("Slice {}: Initial search request successful", slice_id);
+                debug!(
+                    "Slice {}: Initial search request successful",
+                    state.slice_id
+                );
                 r
             }
             Err(e) => {
                 let error = anyhow!(
                     "Slice {}: Failed to initiate search: {} - this might indicate connection issues or invalid credentials",
-                    slice_id,
+                    state.slice_id,
                     e
                 );
                 abort_shared_pit(&shared_pit, &error).await;
@@ -225,7 +264,7 @@ pub fn spawn_retrieval_task(
 
         // Read bytes first to get accurate size
         let response_bytes =
-            match read_checked_response_bytes(response, slice_id, "initial search").await {
+            match read_checked_response_bytes(response, state.slice_id, "initial search").await {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     abort_shared_pit(&shared_pit, &e).await;
@@ -236,7 +275,7 @@ pub fn spawn_retrieval_task(
         let initial_bytes = response_bytes.len() as u64;
         debug!(
             "Slice {}: Read {} bytes for initial response",
-            slice_id, initial_bytes
+            state.slice_id, initial_bytes
         );
 
         // Now parse the JSON from bytes
@@ -244,14 +283,14 @@ pub fn spawn_retrieval_task(
             Ok(json) => {
                 debug!(
                     "Slice {}: Successfully parsed initial response from bytes",
-                    slice_id
+                    state.slice_id
                 );
                 json
             }
             Err(e) => {
                 let error = anyhow!(
                     "Slice {}: Failed to parse initial response from bytes: {} - this might indicate malformed JSON or unexpected response format",
-                    slice_id,
+                    state.slice_id,
                     e
                 );
                 abort_shared_pit(&shared_pit, &error).await;
@@ -265,9 +304,9 @@ pub fn spawn_retrieval_task(
                 let scroll_id = latest_scroll_id(&search_response);
 
                 if let Some(id) = &scroll_id {
-                    debug!("Slice {}: Got scroll_id: {}", slice_id, id);
+                    debug!("Slice {}: Got scroll_id: {}", state.slice_id, id);
                 } else {
-                    debug!("Slice {}: No scroll_id found in response", slice_id);
+                    debug!("Slice {}: No scroll_id found in response", state.slice_id);
                 }
 
                 (scroll_id, false)
@@ -279,96 +318,49 @@ pub fn spawn_retrieval_task(
         };
 
         // Get total hits for this slice
-        let slice_total_hits = extract_total_hits_estimate(&search_response);
+        let slice_total_hits =
+            record_total_hits(&ctx, extract_total_hits_estimate(&search_response));
 
         debug!(
             "Slice {}: Total hits estimate: {} (exact: {})",
-            slice_id, slice_total_hits.value, slice_total_hits.is_exact
+            state.slice_id, slice_total_hits.value, slice_total_hits.is_exact
         );
-
-        // Update the shared total hits counter
-        let previous_total = total_hits_count.fetch_add(slice_total_hits.value, Ordering::Relaxed);
-        let new_total = previous_total + slice_total_hits.value;
-
-        // Update progress bar length if this is the last slice to report
-        if let (Some(ib), Some(ob)) = (&input_bar, &output_bar) {
-            ib.set_length(new_total);
-            ob.set_length(new_total);
-            debug!("Updated progress bar lengths to: {}", new_total);
-        }
 
         // Process the initial batch regardless
         let response_data = Arc::new(search_response);
-        let initial_hits = response_data["hits"]["hits"]
-            .as_array()
-            .map_or(0, |h| h.len()) as u64;
-
-        // Increment retrieved count and update input bar for initial batch
-        let current_retrieved =
-            retrieved_count.fetch_add(initial_hits, Ordering::Relaxed) + initial_hits;
-        let current_bytes_retrieved =
-            retrieved_bytes.fetch_add(initial_bytes, Ordering::Relaxed) + initial_bytes;
-        if let Some(ib) = &input_bar {
-            ib.set_position(current_retrieved);
-            let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6);
-            let bytes_per_sec = current_bytes_retrieved as f64 / elapsed_secs;
-            ib.set_message(format!(
-                "{} @ {} /s",
-                ByteSize(current_bytes_retrieved),
-                ByteSize(bytes_per_sec as u64)
-            ));
+        let initial_hits = response_data["hits"]["hits"].as_array();
+        state.current_id = id_opt;
+        if is_pit {
+            state.update_search_after_from_hits(initial_hits.map(|items| &items[..]));
         }
 
-        let next_worker = slice_id % worker_txs.len();
         if is_pit {
             shared_pit
                 .as_ref()
                 .expect("PIT mode requires shared coordinator")
-                .observe_returned_id(id_opt.as_deref())
+                .observe_returned_id(state.current_id.as_deref())
                 .await;
         }
-        if let Err(e) = worker_txs[next_worker]
-            .send(RetrievalMessage::Batch(response_data.clone()))
-            .await
-        {
-            abort_shared_pit(&shared_pit, &anyhow!(e.to_string())).await;
-            if let Some(id) = &id_opt {
-                cleanup_search_context(&client, &search_type, id, slice_id).await;
-            }
-            return Err(anyhow!(
-                "Failed to send initial batch for slice {}: {}",
-                slice_id,
-                e
-            ));
-        }
-
-        let mut next_worker = (next_worker + 1) % worker_txs.len();
-
-        // Continue searching for this slice
-        let mut retrieved_hits = 0u64;
-        if let Some(initial_hits) = response_data["hits"]["hits"].as_array() {
-            retrieved_hits += initial_hits.len() as u64;
-        }
-
-        // Create a search_after param from the initial response to continue pagination
-        let mut search_after = None;
-        if is_pit {
-            if let Some(last_hit) = response_data["hits"]["hits"]
-                .as_array()
-                .and_then(|hits| hits.last())
+        let initial_hits_are_empty =
+            match dispatch_response_batch(&ctx, &mut state, response_data.clone(), initial_bytes)
+                .await
             {
-                if let Some(sort) = last_hit.get("sort") {
-                    search_after = Some(sort.clone());
+                Ok(hits_are_empty) => hits_are_empty,
+                Err(e) => {
+                    abort_shared_pit(&shared_pit, &anyhow!(e.to_string())).await;
+                    if let Some(id) = &state.current_id {
+                        cleanup_search_context(&ctx.client, &search_type, id, state.slice_id).await;
+                    }
+                    return Err(e);
                 }
-            }
-        }
+            };
 
-        let mut id = match (search_type.clone(), id_opt) {
+        let mut id = match (search_type.clone(), state.current_id.clone()) {
             (SearchType::Scroll, Some(id)) => id,
             (SearchType::Scroll, None) => {
                 return Err(anyhow!(
                     "No ID found for slice {} to continue search",
-                    slice_id
+                    state.slice_id
                 ));
             }
             (SearchType::PointInTime, Some(id)) => id,
@@ -378,7 +370,7 @@ pub fn spawn_retrieval_task(
                     .expect("PIT mode requires shared coordinator")
                     .acquire()
                     .await;
-                pit_generation = Some(lease.generation);
+                state.pit_generation = Some(lease.generation);
                 lease.id
             }
         };
@@ -387,12 +379,11 @@ pub fn spawn_retrieval_task(
             let shared_pit = shared_pit
                 .as_ref()
                 .expect("PIT mode requires shared coordinator");
-            let hits_are_empty = initial_hits == 0;
             if let Err(e) = shared_pit
                 .complete_round(
-                    pit_generation.expect("PIT generation should be set"),
+                    state.pit_generation.expect("PIT generation should be set"),
                     latest_pit_id(response_data.as_ref()),
-                    hits_are_empty,
+                    initial_hits_are_empty,
                 )
                 .await
             {
@@ -400,21 +391,26 @@ pub fn spawn_retrieval_task(
                 return Err(e);
             }
 
-            if hits_are_empty {
-                info!("Search finished for slice {}, no more documents.", slice_id);
+            if initial_hits_are_empty {
+                info!(
+                    "Search finished for slice {}, no more documents.",
+                    state.slice_id
+                );
                 info!(
                     "Slice {} completed, retrieved {} documents",
-                    slice_id, retrieved_hits
+                    state.slice_id, state.retrieved_hits
                 );
                 return Ok(slice_total_hits);
             }
 
             match shared_pit
-                .wait_for_generation(pit_generation.expect("PIT generation should be set") + 1)
+                .wait_for_generation(
+                    state.pit_generation.expect("PIT generation should be set") + 1,
+                )
                 .await
             {
                 Ok(next_lease) => {
-                    pit_generation = Some(next_lease.generation);
+                    state.pit_generation = Some(next_lease.generation);
                     id = next_lease.id;
                 }
                 Err(e) => return Err(e),
@@ -422,7 +418,7 @@ pub fn spawn_retrieval_task(
         }
 
         loop {
-            debug!("Slice {}: Fetching next batch", slice_id);
+            debug!("Slice {}: Fetching next batch", state.slice_id);
             let next_response = match search_type {
                 SearchType::Scroll => {
                     // Create scroll request body with scroll_id and ttl
@@ -431,16 +427,19 @@ pub fn spawn_retrieval_task(
                         "scroll_id": id
                     });
 
-                    debug!("Slice {}: Scrolling with ID {}", slice_id, id);
-                    client
+                    debug!("Slice {}: Scrolling with ID {}", state.slice_id, id);
+                    ctx.client
                         .scroll(ScrollParts::None)
                         .body(scroll_body)
                         .send()
                         .await
                 }
                 SearchType::PointInTime => {
-                    debug!("Slice {}: Continuing PIT search with ID {}", slice_id, id);
-                    let mut next_pit_body = json!(search_body_obj.clone());
+                    debug!(
+                        "Slice {}: Continuing PIT search with ID {}",
+                        state.slice_id, id
+                    );
+                    let mut next_pit_body = state.search_body.clone();
                     ensure_pit_sort(&mut next_pit_body);
                     next_pit_body.as_object_mut().unwrap().insert(
                         &"pit",
@@ -451,21 +450,24 @@ pub fn spawn_retrieval_task(
                     );
 
                     // Add search_after from the last response if available
-                    if let Some(sort_values) = &search_after {
-                        debug!("Slice {}: Using search_after from last result", slice_id);
+                    if let Some(sort_values) = &state.search_after {
+                        debug!(
+                            "Slice {}: Using search_after from last result",
+                            state.slice_id
+                        );
                         next_pit_body
                             .as_object_mut()
                             .unwrap()
                             .insert(&"search_after", sort_values.clone());
                     } else {
-                        debug!("Slice {}: No search_after values available", slice_id);
+                        debug!("Slice {}: No search_after values available", state.slice_id);
                     }
                     debug!(
                         "Next PIT body: {}",
                         sonic_rs::to_string(&next_pit_body).unwrap_or_default()
                     );
 
-                    client
+                    ctx.client
                         .search(SearchParts::None)
                         .body(&next_pit_body)
                         .send()
@@ -475,34 +477,38 @@ pub fn spawn_retrieval_task(
 
             let next_response = match next_response {
                 Ok(res) => {
-                    debug!("Slice {}: Next batch request successful", slice_id);
+                    debug!("Slice {}: Next batch request successful", state.slice_id);
                     res
                 }
                 Err(e) => {
-                    let error = anyhow!("Slice {}: Search continuation error: {}", slice_id, e);
+                    let error =
+                        anyhow!("Slice {}: Search continuation error: {}", state.slice_id, e);
                     abort_shared_pit(&shared_pit, &error).await;
-                    cleanup_search_context(&client, &search_type, &id, slice_id).await;
+                    cleanup_search_context(&ctx.client, &search_type, &id, state.slice_id).await;
                     return Err(error);
                 }
             };
 
             // Read bytes first to get accurate size
-            let next_response_bytes =
-                match read_checked_response_bytes(next_response, slice_id, "continuation search")
-                    .await
-                {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        abort_shared_pit(&shared_pit, &e).await;
-                        cleanup_search_context(&client, &search_type, &id, slice_id).await;
-                        return Err(e);
-                    }
-                };
+            let next_response_bytes = match read_checked_response_bytes(
+                next_response,
+                state.slice_id,
+                "continuation search",
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    abort_shared_pit(&shared_pit, &e).await;
+                    cleanup_search_context(&ctx.client, &search_type, &id, state.slice_id).await;
+                    return Err(e);
+                }
+            };
 
             let batch_bytes = next_response_bytes.len() as u64;
             debug!(
                 "Slice {}: Read {} bytes for continuation response",
-                slice_id, batch_bytes
+                state.slice_id, batch_bytes
             );
 
             // Now parse the JSON from bytes
@@ -511,18 +517,18 @@ pub fn spawn_retrieval_task(
                 Err(e) => {
                     let error = anyhow!(
                         "Slice {}: Failed to parse continuation response from bytes: {}",
-                        slice_id,
+                        state.slice_id,
                         e
                     );
                     abort_shared_pit(&shared_pit, &error).await;
-                    cleanup_search_context(&client, &search_type, &id, slice_id).await;
+                    cleanup_search_context(&ctx.client, &search_type, &id, state.slice_id).await;
                     return Err(error);
                 }
             };
 
             debug!(
                 "Slice {}: Next response JSON: {}",
-                slice_id,
+                state.slice_id,
                 sonic_rs::to_string(&next_response_json).unwrap_or_default()
             );
 
@@ -531,48 +537,17 @@ pub fn spawn_retrieval_task(
                 refresh_search_id(&search_type, &next_response_json, &mut id);
             }
 
-            // Check if we have any hits
-            let hits = next_response_json["hits"]["hits"].as_array();
-            let hits_are_empty = hits.map_or(true, |h| h.is_empty());
-
             // Update search_after with sort values from the last hit for next pagination
-            if is_pit && !hits_are_empty {
-                if let Some(hits_array) = hits {
-                    if let Some(last_hit) = hits_array.last() {
-                        debug!(
-                            "Slice {}: Updating search_after with new values from last hit",
-                            slice_id
-                        );
-                        search_after = Some(last_hit.get("sort").cloned().unwrap_or_default());
-                    }
+            if is_pit {
+                let hits = next_response_json["hits"]["hits"].as_array();
+                let hits_are_empty = hits.is_none_or(|items| items.is_empty());
+                if !hits_are_empty {
+                    debug!(
+                        "Slice {}: Updating search_after with new values from last hit",
+                        state.slice_id
+                    );
                 }
-            }
-
-            // Count hits
-            let mut batch_size = 0;
-            if let Some(hits_array) = hits {
-                batch_size = hits_array.len();
-                retrieved_hits += batch_size as u64;
-                debug!(
-                    "Slice {}: Retrieved batch with {} documents (total: {})",
-                    slice_id, batch_size, retrieved_hits
-                );
-            }
-
-            // Increment retrieved count and update input bar for subsequent batches
-            let current_retrieved =
-                retrieved_count.fetch_add(batch_size as u64, Ordering::Relaxed) + batch_size as u64;
-            let current_bytes_retrieved =
-                retrieved_bytes.fetch_add(batch_bytes, Ordering::Relaxed) + batch_bytes;
-            if let Some(ib) = &input_bar {
-                ib.set_position(current_retrieved);
-                let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6);
-                let bytes_per_sec = current_bytes_retrieved as f64 / elapsed_secs;
-                ib.set_message(format!(
-                    "{} @ {} /s",
-                    ByteSize(current_bytes_retrieved),
-                    ByteSize(bytes_per_sec as u64)
-                ));
+                state.update_search_after_from_hits(hits.map(|items| &items[..]));
             }
 
             let returned_pit_id = if is_pit {
@@ -588,21 +563,21 @@ pub fn spawn_retrieval_task(
                     .await;
             }
 
-            // Send the batch to the next worker in round-robin fashion
-            let batch = RetrievalMessage::Batch(Arc::new(next_response_json));
-            if let Err(e) = worker_txs[next_worker].send(batch).await {
-                abort_shared_pit(&shared_pit, &anyhow!(e.to_string())).await;
-                cleanup_search_context(&client, &search_type, &id, slice_id).await;
-                return Err(anyhow!(
-                    "Failed to send batch to worker {} for slice {}: {}",
-                    next_worker,
-                    slice_id,
-                    e
-                ));
-            }
-
-            // Move to the next worker
-            next_worker = (next_worker + 1) % worker_txs.len();
+            let hits_are_empty = match dispatch_response_batch(
+                &ctx,
+                &mut state,
+                Arc::new(next_response_json),
+                batch_bytes,
+            )
+            .await
+            {
+                Ok(hits_are_empty) => hits_are_empty,
+                Err(e) => {
+                    abort_shared_pit(&shared_pit, &anyhow!(e.to_string())).await;
+                    cleanup_search_context(&ctx.client, &search_type, &id, state.slice_id).await;
+                    return Err(e);
+                }
+            };
 
             if is_pit {
                 let shared_pit = shared_pit
@@ -610,7 +585,7 @@ pub fn spawn_retrieval_task(
                     .expect("PIT mode requires shared coordinator");
                 if let Err(e) = shared_pit
                     .complete_round(
-                        pit_generation.expect("PIT generation should be set"),
+                        state.pit_generation.expect("PIT generation should be set"),
                         returned_pit_id,
                         hits_are_empty,
                     )
@@ -621,31 +596,39 @@ pub fn spawn_retrieval_task(
                 }
 
                 if hits_are_empty {
-                    info!("Search finished for slice {}, no more documents.", slice_id);
+                    info!(
+                        "Search finished for slice {}, no more documents.",
+                        state.slice_id
+                    );
                     break;
                 }
 
                 match shared_pit
-                    .wait_for_generation(pit_generation.expect("PIT generation should be set") + 1)
+                    .wait_for_generation(
+                        state.pit_generation.expect("PIT generation should be set") + 1,
+                    )
                     .await
                 {
                     Ok(next_lease) => {
-                        pit_generation = Some(next_lease.generation);
+                        state.pit_generation = Some(next_lease.generation);
                         id = next_lease.id;
                     }
                     Err(e) => return Err(e),
                 }
             } else if hits_are_empty {
-                info!("Search finished for slice {}, no more documents.", slice_id);
+                info!(
+                    "Search finished for slice {}, no more documents.",
+                    state.slice_id
+                );
                 break;
             }
         }
 
-        cleanup_search_context(&client, &search_type, &id, slice_id).await;
+        cleanup_search_context(&ctx.client, &search_type, &id, state.slice_id).await;
 
         info!(
             "Slice {} completed, retrieved {} documents",
-            slice_id, retrieved_hits
+            state.slice_id, state.retrieved_hits
         );
         Ok(slice_total_hits)
     })

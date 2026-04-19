@@ -1,14 +1,17 @@
+mod context;
 mod messages;
 mod pit;
 mod progress;
 mod retrieval_task;
 mod search_body;
+mod slice_state;
 
 use anyhow::Result;
 use bytesize::ByteSize;
 use elasticsearch::Elasticsearch;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use log::{debug, info};
+use sonic_rs::{JsonValueMutTrait, json};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -18,9 +21,11 @@ use tokio::sync::mpsc;
 
 use crate::cli::{Cli, SearchType};
 
+use self::context::RetrievalContext;
 use self::messages::RetrievalMessage;
 use self::pit::SharedPitCoordinator;
 use self::progress::setup_progress_bars;
+use self::slice_state::SliceState;
 
 /// Main function to dump data from Elasticsearch
 pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result<()> {
@@ -85,9 +90,18 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         None
     };
 
-    // Clone references for retrieval tasks
-    let client_ref = client.clone();
     let total_hits_count = Arc::new(AtomicU64::new(0));
+    let ctx = RetrievalContext {
+        client: client.clone(),
+        index: Arc::<str>::from(index.to_owned()),
+        worker_txs: worker_txs.clone(),
+        total_hits_count: Arc::clone(&total_hits_count),
+        input_bar: input_bar.clone(),
+        output_bar: output_bar.clone(),
+        retrieved_count: Arc::clone(&retrieved_count),
+        retrieved_bytes: Arc::clone(&retrieved_bytes),
+        start_time,
+    };
 
     debug!(
         "Starting {} retrieval task{}",
@@ -99,24 +113,26 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     let mut retrieval_tasks = Vec::with_capacity(num_slices);
 
     for slice_id in 0..num_slices {
+        let mut slice_search_body = search_body.clone();
+        if use_sliced_scroll {
+            slice_search_body.as_object_mut().unwrap().insert(
+                &"slice",
+                json!({
+                    "id": slice_id,
+                    "max": num_slices
+                }),
+            );
+            info!("Starting slice {}/{}", slice_id + 1, num_slices);
+        }
+
+        let slice_state = SliceState::new(slice_id, slice_id % workers, slice_search_body);
         let task = retrieval_task::spawn_retrieval_task(
-            slice_id,
-            client_ref.clone(),
-            index.to_string(),
-            worker_txs.clone(),
-            search_body.clone(),
+            ctx.clone(),
+            slice_state,
             args.search_type.clone(),
             args.scroll.clone(),
             args.pit_keep_alive.clone(),
             shared_pit.clone(),
-            use_sliced_scroll,
-            num_slices,
-            Arc::clone(&total_hits_count),
-            input_bar.clone(),
-            output_bar.clone(),
-            Arc::clone(&retrieved_count),
-            Arc::clone(&retrieved_bytes),
-            start_time.clone(),
         );
 
         retrieval_tasks.push(task);
