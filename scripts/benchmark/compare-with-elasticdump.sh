@@ -193,7 +193,7 @@ validate_index_name() {
   [[ "${value}" != .* ]] || die "BENCH_INDEX must not start with '.', got: ${value}"
   [[ "${value}" != -* ]] || die "BENCH_INDEX must not start with '-', got: ${value}"
   [[ "${value}" != +* ]] || die "BENCH_INDEX must not start with '+', got: ${value}"
-  [[ ! "${value}" =~ [,#/\\*?\"] ]] || die "BENCH_INDEX must be a single safe index name, got: ${value}"
+  [[ ! "${value}" =~ [%,#/\\*?\"] ]] || die "BENCH_INDEX must be a single safe index name, got: ${value}"
   [[ ! "${value}" =~ [[:space:]] ]] || die "BENCH_INDEX must not contain whitespace, got: ${value}"
   [[ "${value}" != */* ]] || die "BENCH_INDEX must not contain path separators, got: ${value}"
   [[ "${value}" != *'<'* ]] || die "BENCH_INDEX must not be a special target expression, got: ${value}"
