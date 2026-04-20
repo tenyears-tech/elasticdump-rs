@@ -915,66 +915,84 @@ node_avg = averages["elasticdump"]["real_seconds"]
 rs_cpu_avg = averages["elasticdump-rs"]["cpu_seconds"]
 node_cpu_avg = averages["elasticdump"]["cpu_seconds"]
 
-if rs_avg == node_avg:
+def display_seconds_text(value):
+    return f"{value:.6f}"
+
+
+def display_seconds_value(value):
+    return float(display_seconds_text(value))
+
+
+rs_avg_text = display_seconds_text(rs_avg)
+node_avg_text = display_seconds_text(node_avg)
+rs_cpu_avg_text = display_seconds_text(rs_cpu_avg)
+node_cpu_avg_text = display_seconds_text(node_cpu_avg)
+
+rs_avg_display = display_seconds_value(rs_avg)
+node_avg_display = display_seconds_value(node_avg)
+rs_cpu_avg_display = display_seconds_value(rs_cpu_avg)
+node_cpu_avg_display = display_seconds_value(node_cpu_avg)
+
+if rs_avg_display == node_avg_display:
     wall_summary = (
         "Wall-clock: elasticdump-rs and elasticdump tied "
-        f"at {rs_avg:.6f}s average wall-clock time"
+        f"at {rs_avg_text}s average wall-clock time"
     )
-elif rs_avg == 0:
+elif rs_avg_display == 0:
     wall_summary = (
         "Wall-clock: elasticdump-rs completed faster than elasticdump "
-        f"({rs_avg:.6f}s avg vs {node_avg:.6f}s avg)"
+        f"({rs_avg_text}s avg vs {node_avg_text}s avg)"
     )
-elif node_avg == 0:
+elif node_avg_display == 0:
     wall_summary = (
         "Wall-clock: elasticdump completed faster than elasticdump-rs "
-        f"({node_avg:.6f}s avg vs {rs_avg:.6f}s avg)"
+        f"({node_avg_text}s avg vs {rs_avg_text}s avg)"
     )
 elif rs_avg < node_avg:
     speedup = node_avg / rs_avg
     wall_summary = (
         "Wall-clock: elasticdump-rs was "
         f"{speedup:.2f}x faster than elasticdump "
-        f"({rs_avg:.6f}s avg vs {node_avg:.6f}s avg)"
+        f"({rs_avg_text}s avg vs {node_avg_text}s avg)"
     )
 else:
     speedup = rs_avg / node_avg
     wall_summary = (
         "Wall-clock: elasticdump was "
         f"{speedup:.2f}x faster than elasticdump-rs "
-        f"({node_avg:.6f}s avg vs {rs_avg:.6f}s avg)"
+        f"({node_avg_text}s avg vs {rs_avg_text}s avg)"
     )
 
-if rs_cpu_avg == node_cpu_avg:
+if rs_cpu_avg_display == node_cpu_avg_display:
     cpu_summary = (
         "CPU total: elasticdump-rs and elasticdump tied "
-        f"at {rs_cpu_avg:.6f}s average CPU time"
+        f"at {rs_cpu_avg_text}s average CPU time"
     )
-elif rs_cpu_avg == 0:
+elif rs_cpu_avg_display == 0:
     cpu_summary = (
         "CPU total: elasticdump-rs used "
         f"{0.0:.2f}x the CPU time of elasticdump "
-        f"({rs_cpu_avg:.6f}s avg vs {node_cpu_avg:.6f}s avg)"
+        f"({rs_cpu_avg_text}s avg vs {node_cpu_avg_text}s avg)"
     )
-elif node_cpu_avg == 0:
+elif node_cpu_avg_display == 0:
     cpu_summary = (
         "CPU total: elasticdump used "
         f"{0.0:.2f}x the CPU time of elasticdump-rs "
-        f"({node_cpu_avg:.6f}s avg vs {rs_cpu_avg:.6f}s avg)"
+        f"({node_cpu_avg_text}s avg vs {rs_cpu_avg_text}s avg)"
     )
 elif rs_cpu_avg > node_cpu_avg:
     cpu_ratio = rs_cpu_avg / node_cpu_avg
     cpu_summary = (
         "CPU total: elasticdump-rs used "
         f"{cpu_ratio:.2f}x the CPU time of elasticdump "
-        f"({rs_cpu_avg:.6f}s avg vs {node_cpu_avg:.6f}s avg)"
+        f"({rs_cpu_avg_text}s avg vs {node_cpu_avg_text}s avg)"
     )
 else:
     cpu_ratio = node_cpu_avg / rs_cpu_avg
     cpu_summary = (
         "CPU total: elasticdump used "
         f"{cpu_ratio:.2f}x the CPU time of elasticdump-rs "
-        f"({node_cpu_avg:.6f}s avg vs {rs_cpu_avg:.6f}s avg)"
+        f"({node_cpu_avg_text}s avg vs {rs_cpu_avg_text}s avg)"
     )
 
 print(wall_summary)
