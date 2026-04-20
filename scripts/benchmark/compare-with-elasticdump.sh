@@ -562,14 +562,6 @@ resolve_rs_binary() {
 }
 
 setup_runtime() {
-  if [[ -n "${BENCH_WORKDIR}" ]]; then
-    mkdir -p -- "${BENCH_WORKDIR}"
-    WORKDIR="$(mktemp -d "${BENCH_WORKDIR}/elasticdump-rs-bench.XXXXXX")"
-  else
-    WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/elasticdump-rs-bench.XXXXXX")"
-  fi
-  WORKDIR_CREATED=1
-
   if [[ -n "${BENCH_INDEX_NAME}" ]]; then
     BENCH_INDEX="${BENCH_INDEX_NAME}"
   else
@@ -577,6 +569,14 @@ setup_runtime() {
   fi
 
   validate_index_name "${BENCH_INDEX}"
+
+  if [[ -n "${BENCH_WORKDIR}" ]]; then
+    mkdir -p -- "${BENCH_WORKDIR}"
+    WORKDIR="$(mktemp -d "${BENCH_WORKDIR}/elasticdump-rs-bench.XXXXXX")"
+  else
+    WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/elasticdump-rs-bench.XXXXXX")"
+  fi
+  WORKDIR_CREATED=1
 }
 
 cleanup() {
