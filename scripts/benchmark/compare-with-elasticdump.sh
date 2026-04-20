@@ -20,6 +20,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
 
 WORKDIR=""
+WORKDIR_CREATED=0
 BENCH_INDEX=""
 RS_BIN=""
 declare -a ELASTICDUMP_CMD=()
@@ -61,54 +62,67 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --es-url)
+        require_option_value "$@"
         ES_URL="$2"
         shift 2
         ;;
       --docs)
+        require_option_value "$@"
         BENCH_DOCS="$2"
         shift 2
         ;;
       --bulk-size)
+        require_option_value "$@"
         BENCH_BULK_SIZE="$2"
         shift 2
         ;;
       --limit)
+        require_option_value "$@"
         BENCH_LIMIT="$2"
         shift 2
         ;;
       --text-bytes)
+        require_option_value "$@"
         BENCH_TEXT_BYTES="$2"
         shift 2
         ;;
       --warmup-runs)
+        require_option_value "$@"
         BENCH_WARMUP_RUNS="$2"
         shift 2
         ;;
       --measured-runs)
+        require_option_value "$@"
         BENCH_MEASURED_RUNS="$2"
         shift 2
         ;;
       --keep-artifacts)
+        require_option_value "$@"
         BENCH_KEEP_ARTIFACTS="$2"
         shift 2
         ;;
       --index-name)
+        require_option_value "$@"
         BENCH_INDEX_NAME="$2"
         shift 2
         ;;
       --index-prefix)
+        require_option_value "$@"
         BENCH_INDEX_PREFIX="$2"
         shift 2
         ;;
       --workdir)
+        require_option_value "$@"
         BENCH_WORKDIR="$2"
         shift 2
         ;;
       --rs-bin)
+        require_option_value "$@"
         BENCH_RS_BIN="$2"
         shift 2
         ;;
       --elasticdump-cmd)
+        require_option_value "$@"
         BENCH_ELASTICDUMP_CMD="$2"
         shift 2
         ;;
@@ -121,6 +135,12 @@ parse_args() {
         ;;
     esac
   done
+}
+
+require_option_value() {
+  local option="$1"
+
+  [[ $# -ge 2 ]] || die "Missing value for ${option}"
 }
 
 require_command() {
@@ -197,10 +217,11 @@ resolve_rs_binary() {
 setup_runtime() {
   if [[ -n "${BENCH_WORKDIR}" ]]; then
     mkdir -p -- "${BENCH_WORKDIR}"
-    WORKDIR="${BENCH_WORKDIR}"
+    WORKDIR="$(mktemp -d "${BENCH_WORKDIR}/elasticdump-rs-bench.XXXXXX")"
   else
     WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/elasticdump-rs-bench.XXXXXX")"
   fi
+  WORKDIR_CREATED=1
 
   if [[ -n "${BENCH_INDEX_NAME}" ]]; then
     BENCH_INDEX="${BENCH_INDEX_NAME}"
@@ -218,7 +239,7 @@ cleanup() {
     return "${exit_code}"
   fi
 
-  if [[ -n "${WORKDIR}" && -d "${WORKDIR}" ]]; then
+  if [[ "${WORKDIR_CREATED}" == "1" && -n "${WORKDIR}" && -d "${WORKDIR}" ]]; then
     rm -rf -- "${WORKDIR}"
   fi
 
