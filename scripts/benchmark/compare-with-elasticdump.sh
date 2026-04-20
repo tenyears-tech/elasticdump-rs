@@ -561,6 +561,332 @@ resolve_rs_binary() {
   RS_BIN="${REPO_ROOT}/target/release/elasticdump-rs"
 }
 
+count_file_lines() {
+  local file_path="$1"
+  local line_count
+
+  [[ -f "${file_path}" ]] || die "Expected output file does not exist: ${file_path}"
+  line_count="$(wc -l < "${file_path}")"
+  line_count="${line_count//[[:space:]]/}"
+  printf '%s\n' "${line_count}"
+}
+
+count_file_bytes() {
+  local file_path="$1"
+  local byte_count
+
+  [[ -f "${file_path}" ]] || die "Expected output file does not exist: ${file_path}"
+  byte_count="$(wc -c < "${file_path}")"
+  byte_count="${byte_count//[[:space:]]/}"
+  printf '%s\n' "${byte_count}"
+}
+
+run_timed_command() {
+  local metrics_file="$1"
+
+  shift
+  "${PYTHON_BIN}" - "${metrics_file}" "$@" <<'PY'
+import pathlib
+import subprocess
+import sys
+import time
+
+metrics_file = pathlib.Path(sys.argv[1])
+command = sys.argv[2:]
+
+start = time.perf_counter()
+completed = subprocess.run(command, check=False)
+duration = time.perf_counter() - start
+metrics_file.write_text(f"{duration:.6f}\n", encoding="ascii")
+sys.exit(completed.returncode)
+PY
+}
+
+read_duration_seconds() {
+  local metrics_file="$1"
+
+  [[ -f "${metrics_file}" ]] || die "Expected metrics file does not exist: ${metrics_file}"
+  "${PYTHON_BIN}" - "${metrics_file}" <<'PY'
+import pathlib
+import sys
+
+metrics_file = pathlib.Path(sys.argv[1])
+raw = metrics_file.read_text(encoding="ascii").strip()
+
+try:
+    duration = float(raw)
+except ValueError as exc:
+    raise SystemExit(f"Invalid duration in {metrics_file}: {raw}") from exc
+
+print(f"{duration:.6f}")
+PY
+}
+
+write_results_header() {
+  local results_file="$1"
+
+  printf 'tool\trun\tduration\tlines\tbytes\n' > "${results_file}"
+}
+
+append_result() {
+  local results_file="$1"
+  local tool_name="$2"
+  local run_number="$3"
+  local duration="$4"
+  local line_count="$5"
+  local byte_count="$6"
+
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "${tool_name}" \
+    "${run_number}" \
+    "${duration}" \
+    "${line_count}" \
+    "${byte_count}" >> "${results_file}"
+}
+
+validate_line_count() {
+  local tool_name="$1"
+  local output_file="$2"
+  local expected_lines="$3"
+  local actual_lines="$4"
+
+  [[ "${actual_lines}" == "${expected_lines}" ]] || die \
+    "${tool_name} output line count mismatch for ${output_file}: expected ${expected_lines}, got ${actual_lines}"
+}
+
+log_run_metrics() {
+  local tool_name="$1"
+  local phase="$2"
+  local run_number="$3"
+  local run_total="$4"
+  local duration="$5"
+  local line_count="$6"
+  local byte_count="$7"
+
+  log "${phase} ${run_number}/${run_total} ${tool_name}: ${duration}s, ${line_count} lines, ${byte_count} bytes"
+}
+
+run_one_series_entry() {
+  local tool_name="$1"
+  local phase="$2"
+  local run_number="$3"
+  local run_total="$4"
+  local output_file="$5"
+  local metrics_file="$6"
+  local results_file="$7"
+  local duration
+  local line_count
+  local byte_count
+
+  shift 7
+
+  run_timed_command "${metrics_file}" "$@" || die "${tool_name} ${phase} run ${run_number} failed"
+  duration="$(read_duration_seconds "${metrics_file}")"
+  line_count="$(count_file_lines "${output_file}")"
+  byte_count="$(count_file_bytes "${output_file}")"
+  validate_line_count "${tool_name}" "${output_file}" "${BENCH_DOCS}" "${line_count}"
+  log_run_metrics "${tool_name}" "${phase}" "${run_number}" "${run_total}" "${duration}" "${line_count}" "${byte_count}"
+
+  if [[ "${phase}" == "measured" ]]; then
+    append_result "${results_file}" "${tool_name}" "${run_number}" "${duration}" "${line_count}" "${byte_count}"
+  fi
+}
+
+run_elasticdump_rs_series() {
+  local results_file="$1"
+  local run_number
+  local output_file
+  local metrics_file
+  local input_url
+
+  input_url="$(es_url "/${BENCH_INDEX}")"
+
+  for (( run_number = 1; run_number <= BENCH_WARMUP_RUNS; run_number++ )); do
+    output_file="${WORKDIR}/elasticdump-rs.warmup.${run_number}.jsonl"
+    metrics_file="${WORKDIR}/elasticdump-rs.warmup.${run_number}.metrics"
+    run_one_series_entry \
+      "elasticdump-rs" \
+      "warmup" \
+      "${run_number}" \
+      "${BENCH_WARMUP_RUNS}" \
+      "${output_file}" \
+      "${metrics_file}" \
+      "${results_file}" \
+      "${RS_BIN}" \
+      --input "${input_url}" \
+      --output "${output_file}" \
+      --type data \
+      --limit "${BENCH_LIMIT}" \
+      --scrollTime 10m \
+      --searchType scroll \
+      --overwrite \
+      --quiet
+  done
+
+  for (( run_number = 1; run_number <= BENCH_MEASURED_RUNS; run_number++ )); do
+    output_file="${WORKDIR}/elasticdump-rs.measured.${run_number}.jsonl"
+    metrics_file="${WORKDIR}/elasticdump-rs.measured.${run_number}.metrics"
+    run_one_series_entry \
+      "elasticdump-rs" \
+      "measured" \
+      "${run_number}" \
+      "${BENCH_MEASURED_RUNS}" \
+      "${output_file}" \
+      "${metrics_file}" \
+      "${results_file}" \
+      "${RS_BIN}" \
+      --input "${input_url}" \
+      --output "${output_file}" \
+      --type data \
+      --limit "${BENCH_LIMIT}" \
+      --scrollTime 10m \
+      --searchType scroll \
+      --overwrite \
+      --quiet
+  done
+}
+
+run_elasticdump_series() {
+  local results_file="$1"
+  local run_number
+  local output_file
+  local metrics_file
+  local input_url
+
+  input_url="$(es_url "/${BENCH_INDEX}")"
+
+  for (( run_number = 1; run_number <= BENCH_WARMUP_RUNS; run_number++ )); do
+    output_file="${WORKDIR}/elasticdump.warmup.${run_number}.jsonl"
+    metrics_file="${WORKDIR}/elasticdump.warmup.${run_number}.metrics"
+    run_one_series_entry \
+      "elasticdump" \
+      "warmup" \
+      "${run_number}" \
+      "${BENCH_WARMUP_RUNS}" \
+      "${output_file}" \
+      "${metrics_file}" \
+      "${results_file}" \
+      "${ELASTICDUMP_CMD[@]}" \
+      --input "${input_url}" \
+      --output "${output_file}" \
+      --limit "${BENCH_LIMIT}" \
+      --scrollTime 10m \
+      --quiet \
+      --overwrite \
+      --type=data
+  done
+
+  for (( run_number = 1; run_number <= BENCH_MEASURED_RUNS; run_number++ )); do
+    output_file="${WORKDIR}/elasticdump.measured.${run_number}.jsonl"
+    metrics_file="${WORKDIR}/elasticdump.measured.${run_number}.metrics"
+    run_one_series_entry \
+      "elasticdump" \
+      "measured" \
+      "${run_number}" \
+      "${BENCH_MEASURED_RUNS}" \
+      "${output_file}" \
+      "${metrics_file}" \
+      "${results_file}" \
+      "${ELASTICDUMP_CMD[@]}" \
+      --input "${input_url}" \
+      --output "${output_file}" \
+      --limit "${BENCH_LIMIT}" \
+      --scrollTime 10m \
+      --quiet \
+      --overwrite \
+      --type=data
+  done
+}
+
+print_summary() {
+  local results_file="$1"
+
+  "${PYTHON_BIN}" - "${results_file}" "${BENCH_MEASURED_RUNS}" <<'PY'
+import csv
+import sys
+
+results_file = sys.argv[1]
+expected_runs = int(sys.argv[2])
+tools = ("elasticdump-rs", "elasticdump")
+rows_by_tool = {tool: [] for tool in tools}
+
+with open(results_file, "r", encoding="utf-8", newline="") as handle:
+    reader = csv.DictReader(handle, delimiter="\t")
+    expected_fields = ["tool", "run", "duration", "lines", "bytes"]
+    if reader.fieldnames != expected_fields:
+        raise SystemExit(
+            f"Unexpected results header in {results_file}: {reader.fieldnames!r}"
+        )
+
+    for row in reader:
+        tool = row["tool"]
+        if tool not in rows_by_tool:
+            raise SystemExit(f"Unexpected tool in results: {tool}")
+        rows_by_tool[tool].append(
+            {
+                "run": int(row["run"]),
+                "duration": float(row["duration"]),
+                "lines": int(row["lines"]),
+                "bytes": int(row["bytes"]),
+            }
+        )
+
+for tool, rows in rows_by_tool.items():
+    if len(rows) != expected_runs:
+        raise SystemExit(
+            f"Measured run count mismatch for {tool}: expected {expected_runs}, got {len(rows)}"
+        )
+
+if len(rows_by_tool["elasticdump-rs"]) != len(rows_by_tool["elasticdump"]):
+    raise SystemExit("Measured run counts differ between elasticdump-rs and elasticdump")
+
+print("Measured runs (warmups excluded)")
+for tool in tools:
+    for row in rows_by_tool[tool]:
+        print(
+            f"  {tool} run {row['run']}: "
+            f"{row['duration']:.6f}s, {row['lines']} lines, {row['bytes']} bytes"
+        )
+
+print("Averages")
+averages = {}
+for tool in tools:
+    rows = rows_by_tool[tool]
+    averages[tool] = {
+        "duration": sum(row["duration"] for row in rows) / len(rows),
+        "lines": round(sum(row["lines"] for row in rows) / len(rows)),
+        "bytes": round(sum(row["bytes"] for row in rows) / len(rows)),
+    }
+    avg = averages[tool]
+    print(
+        f"  {tool}: "
+        f"{avg['duration']:.6f}s avg, {avg['lines']} lines avg, {avg['bytes']} bytes avg"
+    )
+
+rs_avg = averages["elasticdump-rs"]["duration"]
+node_avg = averages["elasticdump"]["duration"]
+
+if rs_avg == node_avg:
+    print(
+        f"Headline: elasticdump-rs and elasticdump tied at {rs_avg:.6f}s average wall-clock time"
+    )
+elif rs_avg < node_avg:
+    speedup = node_avg / rs_avg
+    print(
+        "Headline: elasticdump-rs was "
+        f"{speedup:.2f}x faster than elasticdump "
+        f"({rs_avg:.6f}s avg vs {node_avg:.6f}s avg)"
+    )
+else:
+    speedup = rs_avg / node_avg
+    print(
+        "Headline: elasticdump was "
+        f"{speedup:.2f}x faster than elasticdump-rs "
+        f"({node_avg:.6f}s avg vs {rs_avg:.6f}s avg)"
+    )
+PY
+}
+
 setup_runtime() {
   if [[ -n "${BENCH_INDEX_NAME}" ]]; then
     BENCH_INDEX="${BENCH_INDEX_NAME}"
@@ -604,6 +930,7 @@ cleanup() {
 main() {
   local total_runs
   local seeded_docs
+  local results_file
 
   parse_args "$@"
   validate_config
@@ -643,6 +970,18 @@ main() {
   resolve_rs_binary
   printf '  RS_BIN=%s\n' "${RS_BIN}"
   printf '  ELASTICDUMP_CMD=%s\n' "${ELASTICDUMP_CMD[*]}"
+
+  results_file="${WORKDIR}/measured-runs.tsv"
+  write_results_header "${results_file}"
+
+  run_elasticdump_rs_series "${results_file}"
+  run_elasticdump_series "${results_file}"
+
+  if (( BENCH_MEASURED_RUNS > 0 )); then
+    print_summary "${results_file}"
+  else
+    log "No measured runs requested; warmup-only benchmark finished"
+  fi
 }
 
 main "$@"
