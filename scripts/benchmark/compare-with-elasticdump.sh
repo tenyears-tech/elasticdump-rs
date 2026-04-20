@@ -585,7 +585,7 @@ run_timed_command() {
   local metrics_file="$1"
 
   shift
-  /usr/bin/time -p -o "${metrics_file}" "$@"
+  /usr/bin/time -p sh -c 'exec "$@" 2>&3' sh "$@" 3>&2 2>"${metrics_file}"
 }
 
 read_timing_metrics() {
