@@ -142,6 +142,7 @@ Local prerequisites:
 - a reachable Elasticsearch node at `ES_URL` (default `http://localhost:9200`)
 - `elasticdump`
 - `/usr/bin/time`
+- `mktemp`
 - `python3`
 - `curl`
 - a built `elasticdump-rs` release binary or a buildable workspace

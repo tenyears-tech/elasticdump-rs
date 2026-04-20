@@ -622,7 +622,7 @@ real = values["real"][0]
 user = values["user"][0]
 sys_seconds = values["sys"][0]
 cpu = user + sys_seconds
-print(f"{real:.6f}\t{user:.6f}\t{sys_seconds:.6f}\t{cpu:.6f}")
+print(f"{real:.2f}\t{user:.2f}\t{sys_seconds:.2f}\t{cpu:.2f}")
 PY
 }
 
@@ -883,9 +883,9 @@ for tool in tools:
     for row in rows_by_tool[tool]:
         print(
             f"  {tool} run {row['run']}: "
-            f"wall {row['real_seconds']:.6f}s | "
-            f"cpu {row['cpu_seconds']:.6f}s "
-            f"(user {row['user_seconds']:.6f}s + sys {row['sys_seconds']:.6f}s), "
+            f"wall {row['real_seconds']:.2f}s | "
+            f"cpu {row['cpu_seconds']:.2f}s "
+            f"(user {row['user_seconds']:.2f}s + sys {row['sys_seconds']:.2f}s), "
             f"{row['lines']} lines, {row['bytes']} bytes"
         )
 
@@ -904,9 +904,9 @@ for tool in tools:
     avg = averages[tool]
     print(
         f"  {tool}: "
-        f"wall {avg['real_seconds']:.6f}s avg | "
-        f"cpu {avg['cpu_seconds']:.6f}s avg "
-        f"(user {avg['user_seconds']:.6f}s + sys {avg['sys_seconds']:.6f}s), "
+        f"wall {avg['real_seconds']:.2f}s avg | "
+        f"cpu {avg['cpu_seconds']:.2f}s avg "
+        f"(user {avg['user_seconds']:.2f}s + sys {avg['sys_seconds']:.2f}s), "
         f"{avg['lines']} lines avg, {avg['bytes']} bytes avg"
     )
 
@@ -916,7 +916,7 @@ rs_cpu_avg = averages["elasticdump-rs"]["cpu_seconds"]
 node_cpu_avg = averages["elasticdump"]["cpu_seconds"]
 
 def display_seconds_text(value):
-    return f"{value:.6f}"
+    return f"{value:.2f}"
 
 
 def display_seconds_value(value):
