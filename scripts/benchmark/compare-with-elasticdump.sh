@@ -830,6 +830,7 @@ print_summary() {
   "${PYTHON_BIN}" - "${results_file}" "${BENCH_MEASURED_RUNS}" <<'PY'
 import csv
 import sys
+from decimal import Decimal
 
 results_file = sys.argv[1]
 expected_runs = int(sys.argv[2])
@@ -890,6 +891,23 @@ for tool in tools:
         )
 
 print("Averages")
+
+def display_seconds_text(value):
+    return f"{value:.2f}"
+
+
+def display_seconds_value(value):
+    return float(display_seconds_text(value))
+
+
+def display_sum_text(*displayed_parts):
+    total = sum(Decimal(part) for part in displayed_parts)
+    return f"{total:.2f}"
+
+
+def display_sum_value(*displayed_parts):
+    return float(display_sum_text(*displayed_parts))
+
 averages = {}
 for tool in tools:
     rows = rows_by_tool[tool]
@@ -902,36 +920,38 @@ for tool in tools:
         "bytes": round(sum(row["bytes"] for row in rows) / len(rows)),
     }
     avg = averages[tool]
+    user_avg_text = display_seconds_text(avg["user_seconds"])
+    sys_avg_text = display_seconds_text(avg["sys_seconds"])
+    cpu_avg_text = display_sum_text(user_avg_text, sys_avg_text)
+    avg["display_user_seconds"] = user_avg_text
+    avg["display_sys_seconds"] = sys_avg_text
+    avg["display_cpu_seconds"] = cpu_avg_text
     print(
         f"  {tool}: "
-        f"wall {avg['real_seconds']:.2f}s avg | "
-        f"cpu {avg['cpu_seconds']:.2f}s avg "
-        f"(user {avg['user_seconds']:.2f}s + sys {avg['sys_seconds']:.2f}s), "
+        f"wall {display_seconds_text(avg['real_seconds'])}s avg | "
+        f"cpu {avg['display_cpu_seconds']}s avg "
+        f"(user {avg['display_user_seconds']}s + sys {avg['display_sys_seconds']}s), "
         f"{avg['lines']} lines avg, {avg['bytes']} bytes avg"
     )
 
 rs_avg = averages["elasticdump-rs"]["real_seconds"]
 node_avg = averages["elasticdump"]["real_seconds"]
-rs_cpu_avg = averages["elasticdump-rs"]["cpu_seconds"]
-node_cpu_avg = averages["elasticdump"]["cpu_seconds"]
-
-def display_seconds_text(value):
-    return f"{value:.2f}"
-
-
-def display_seconds_value(value):
-    return float(display_seconds_text(value))
-
 
 rs_avg_text = display_seconds_text(rs_avg)
 node_avg_text = display_seconds_text(node_avg)
-rs_cpu_avg_text = display_seconds_text(rs_cpu_avg)
-node_cpu_avg_text = display_seconds_text(node_cpu_avg)
+rs_cpu_avg_text = averages["elasticdump-rs"]["display_cpu_seconds"]
+node_cpu_avg_text = averages["elasticdump"]["display_cpu_seconds"]
 
 rs_avg_display = display_seconds_value(rs_avg)
 node_avg_display = display_seconds_value(node_avg)
-rs_cpu_avg_display = display_seconds_value(rs_cpu_avg)
-node_cpu_avg_display = display_seconds_value(node_cpu_avg)
+rs_cpu_avg_display = display_sum_value(
+    averages["elasticdump-rs"]["display_user_seconds"],
+    averages["elasticdump-rs"]["display_sys_seconds"],
+)
+node_cpu_avg_display = display_sum_value(
+    averages["elasticdump"]["display_user_seconds"],
+    averages["elasticdump"]["display_sys_seconds"],
+)
 
 if rs_avg_display == node_avg_display:
     wall_summary = (
@@ -980,15 +1000,15 @@ elif node_cpu_avg_display == 0:
         f"{0.0:.2f}x the CPU time of elasticdump-rs "
         f"({node_cpu_avg_text}s avg vs {rs_cpu_avg_text}s avg)"
     )
-elif rs_cpu_avg > node_cpu_avg:
-    cpu_ratio = rs_cpu_avg / node_cpu_avg
+elif rs_cpu_avg_display > node_cpu_avg_display:
+    cpu_ratio = rs_cpu_avg_display / node_cpu_avg_display
     cpu_summary = (
         "CPU total: elasticdump-rs used "
         f"{cpu_ratio:.2f}x the CPU time of elasticdump "
         f"({rs_cpu_avg_text}s avg vs {node_cpu_avg_text}s avg)"
     )
 else:
-    cpu_ratio = node_cpu_avg / rs_cpu_avg
+    cpu_ratio = node_cpu_avg_display / rs_cpu_avg_display
     cpu_summary = (
         "CPU total: elasticdump used "
         f"{cpu_ratio:.2f}x the CPU time of elasticdump-rs "
