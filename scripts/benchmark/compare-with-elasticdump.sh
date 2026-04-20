@@ -22,6 +22,7 @@ SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
 WORKDIR=""
 WORKDIR_CREATED=0
 BENCH_INDEX=""
+PYTHON_BIN=""
 RS_BIN=""
 declare -a ELASTICDUMP_CMD=()
 
@@ -147,6 +148,14 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
+resolve_command_path() {
+  local command_name="$1"
+  local resolved_path
+
+  resolved_path="$(command -v "${command_name}")" || die "Missing required command: ${command_name}"
+  printf '%s\n' "${resolved_path}"
+}
+
 es_url() {
   local path="${1:-}"
   printf '%s%s\n' "${ES_URL%/}" "${path}"
@@ -159,7 +168,7 @@ parse_shell_words() {
   while IFS= read -r item; do
     ELASTICDUMP_CMD+=("$item")
   done < <(
-    python3 - "$raw" <<'PY'
+    "${PYTHON_BIN}" - "$raw" <<'PY'
 import shlex
 import sys
 
@@ -174,6 +183,22 @@ validate_uint() {
   local value="$2"
 
   [[ "$value" =~ ^[0-9]+$ ]] || die "${name} must be an unsigned integer, got: ${value}"
+  [[ ! "$value" =~ ^0[0-9]+$ ]] || die "${name} must not use leading-zero notation, got: ${value}"
+}
+
+validate_index_name() {
+  local value="$1"
+
+  [[ -n "${value}" ]] || die "BENCH_INDEX must not be empty"
+  [[ "${value}" != .* ]] || die "BENCH_INDEX must not start with '.', got: ${value}"
+  [[ "${value}" != -* ]] || die "BENCH_INDEX must not start with '-', got: ${value}"
+  [[ "${value}" != +* ]] || die "BENCH_INDEX must not start with '+', got: ${value}"
+  [[ ! "${value}" =~ [,/\\*?\"] ]] || die "BENCH_INDEX must be a single safe index name, got: ${value}"
+  [[ ! "${value}" =~ [[:space:]] ]] || die "BENCH_INDEX must not contain whitespace, got: ${value}"
+  [[ "${value}" != */* ]] || die "BENCH_INDEX must not contain path separators, got: ${value}"
+  [[ "${value}" != *'<'* ]] || die "BENCH_INDEX must not be a special target expression, got: ${value}"
+  [[ "${value}" != *'>'* ]] || die "BENCH_INDEX must not be a special target expression, got: ${value}"
+  [[ ! "${value}" =~ ^(_all|\*)$ ]] || die "BENCH_INDEX must not be a multi-target expression, got: ${value}"
 }
 
 validate_config() {
@@ -193,6 +218,10 @@ validate_config() {
 
   (( BENCH_BULK_SIZE > 0 )) || die "BENCH_BULK_SIZE must be greater than zero"
   (( BENCH_LIMIT > 0 )) || die "BENCH_LIMIT must be greater than zero"
+}
+
+resolve_python() {
+  PYTHON_BIN="$(resolve_command_path python3)"
 }
 
 delete_index_if_exists() {
@@ -293,7 +322,7 @@ generate_bulk_batch() {
   local batch_size="$2"
   local output_file="$3"
 
-  /usr/bin/python3 - "${BENCH_INDEX}" "${start_doc}" "${batch_size}" "${BENCH_TEXT_BYTES}" "${output_file}" <<'PY'
+  "${PYTHON_BIN}" - "${BENCH_INDEX}" "${start_doc}" "${batch_size}" "${BENCH_TEXT_BYTES}" "${output_file}" <<'PY'
 import json
 import sys
 
@@ -353,7 +382,7 @@ validate_bulk_response() {
   local response_file="$1"
   local expected_items="$2"
 
-  /usr/bin/python3 - "${response_file}" "${expected_items}" <<'PY'
+  "${PYTHON_BIN}" - "${response_file}" "${expected_items}" <<'PY'
 import json
 import sys
 
@@ -491,7 +520,7 @@ count_index_documents() {
     die "Failed to count documents in ${BENCH_INDEX} (HTTP ${http_code})"
   fi
 
-  /usr/bin/python3 - "${response_file}" <<'PY'
+  "${PYTHON_BIN}" - "${response_file}" <<'PY'
 import json
 import sys
 
@@ -546,6 +575,8 @@ setup_runtime() {
   else
     BENCH_INDEX="${BENCH_INDEX_PREFIX}_$(date -u +%Y%m%dt%H%M%sz)_$$"
   fi
+
+  validate_index_name "${BENCH_INDEX}"
 }
 
 cleanup() {
@@ -578,7 +609,7 @@ main() {
   validate_config
   require_command curl
   require_command mktemp
-  require_command python3
+  resolve_python
   setup_runtime
   trap cleanup EXIT
 
