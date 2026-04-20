@@ -126,29 +126,45 @@ This tool is inspired by the Node.js [elasticdump](https://github.com/elasticsea
 
 `elasticdump-rs` is optimized for high throughput and low memory usage, making it suitable for dumping large indices. The performance will vary based on your network, Elasticsearch cluster, and local machine capabilities.
 
-In performance tests on a modern machine with a local Elasticsearch instance, `elasticdump-rs` can typically process thousands of documents per second.
+The canonical maintainer-run local comparison lives in `scripts/benchmark/compare-with-elasticdump.sh`. It is intended for apples-to-apples benchmarking against the original Node.js `elasticdump`, outside the normal Rust integration test harness.
 
-```shell
-❯ http -b "http://localhost:9200/_cat/indices/elasticdump_rs_test_manual_1744878888?v"
-health status index                                 uuid                   pri rep docs.count docs.deleted store.size pri.store.size
-green  open   elasticdump_rs_test_manual_1744878888 -Y-aMCVCSjyWs4jzYQdXDg   1   0    1000100            0    132.6mb        132.6mb
+The benchmark script:
 
-❯ /usr/bin/time elasticdump-rs --input=http://localhost:9200/elasticdump_rs_test_manual_1744878888 --output=$ --limit=10000 --quiet | pv -tab | wc -l
-        2.54 real         0.88 user         0.59 sys
- 741MiB 0:00:02 ( 291MiB/s)
- 1000100
+- creates and seeds its own logging-style benchmark index
+- runs `elasticdump-rs` and the original `elasticdump` sequentially with the same practical settings
+- keeps `elasticdump-rs` on Scroll mode for direct comparability with `elasticdump`
+- treats the first pass for each tool as a warmup by default
+- validates output line counts before reporting a result
+- prints a human-readable per-run summary plus averages and a headline comparison
 
-❯ /usr/bin/time elasticdump --input=http://localhost:9200/elasticdump_rs_test_manual_1744878888 --output=$ --limit=10000 --quiet | pv -tab | wc -l
-       11.51 real         7.59 user         1.46 sys
- 739MiB 0:00:11 (64.3MiB/s)
- 1000100
+Local prerequisites:
+
+- a reachable Elasticsearch node at `ES_URL` (default `http://localhost:9200`)
+- `elasticdump`
+- `python3`
+- `curl`
+- a built `elasticdump-rs` release binary or a buildable workspace
+
+Typical maintainer run:
+
+```bash
+scripts/benchmark/compare-with-elasticdump.sh
 ```
 
-*We are using `0.16x` cpu time and achieve `4.5x` throughput compared to the original `elasticdump`.*
+Useful environment overrides:
 
-*Note: The minor difference in output sizes (e.g., 741MiB vs 739MiB in the example) is due to differences in JSON serialization. `elasticdump-rs` represents floating-point numbers like `0.0` accurately, while the original Node.js `elasticdump` may represent them as integers (`0`), resulting in slightly smaller output.*
+```bash
+BENCH_DOCS=200000 \
+BENCH_BULK_SIZE=5000 \
+BENCH_LIMIT=10000 \
+BENCH_TEXT_BYTES=256 \
+BENCH_WARMUP_RUNS=1 \
+BENCH_MEASURED_RUNS=2 \
+BENCH_KEEP_ARTIFACTS=1 \
+scripts/benchmark/compare-with-elasticdump.sh
+```
 
-*Note: These are results from rough tests performed on M1 Max MacBook Pro.*
+Warmup runs are excluded from the headline result. Only measured runs are recorded in the summary and used for the average wall-clock comparison.
 
 ## Testing
 
