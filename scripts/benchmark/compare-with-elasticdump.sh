@@ -669,11 +669,14 @@ log_run_metrics() {
   local phase="$2"
   local run_number="$3"
   local run_total="$4"
-  local duration="$5"
-  local line_count="$6"
-  local byte_count="$7"
+  local real_seconds="$5"
+  local user_seconds="$6"
+  local sys_seconds="$7"
+  local cpu_seconds="$8"
+  local line_count="$9"
+  local byte_count="${10}"
 
-  log "${phase} ${run_number}/${run_total} ${tool_name}: ${duration}s, ${line_count} lines, ${byte_count} bytes"
+  log "${phase} ${run_number}/${run_total} ${tool_name}: wall ${real_seconds}s | cpu ${cpu_seconds}s (user ${user_seconds}s + sys ${sys_seconds}s), ${line_count} lines, ${byte_count} bytes"
 }
 
 run_one_series_entry() {
@@ -700,7 +703,17 @@ run_one_series_entry() {
   line_count="$(count_file_lines "${output_file}")"
   byte_count="$(count_file_bytes "${output_file}")"
   validate_line_count "${tool_name}" "${output_file}" "${BENCH_DOCS}" "${line_count}"
-  log_run_metrics "${tool_name}" "${phase}" "${run_number}" "${run_total}" "${real_seconds}" "${line_count}" "${byte_count}"
+  log_run_metrics \
+    "${tool_name}" \
+    "${phase}" \
+    "${run_number}" \
+    "${run_total}" \
+    "${real_seconds}" \
+    "${user_seconds}" \
+    "${sys_seconds}" \
+    "${cpu_seconds}" \
+    "${line_count}" \
+    "${byte_count}"
 
   if [[ "${phase}" == "measured" ]]; then
     append_result \
@@ -870,7 +883,10 @@ for tool in tools:
     for row in rows_by_tool[tool]:
         print(
             f"  {tool} run {row['run']}: "
-            f"{row['real_seconds']:.6f}s, {row['lines']} lines, {row['bytes']} bytes"
+            f"wall {row['real_seconds']:.6f}s | "
+            f"cpu {row['cpu_seconds']:.6f}s "
+            f"(user {row['user_seconds']:.6f}s + sys {row['sys_seconds']:.6f}s), "
+            f"{row['lines']} lines, {row['bytes']} bytes"
         )
 
 print("Averages")
@@ -879,46 +895,90 @@ for tool in tools:
     rows = rows_by_tool[tool]
     averages[tool] = {
         "real_seconds": sum(row["real_seconds"] for row in rows) / len(rows),
+        "user_seconds": sum(row["user_seconds"] for row in rows) / len(rows),
+        "sys_seconds": sum(row["sys_seconds"] for row in rows) / len(rows),
+        "cpu_seconds": sum(row["cpu_seconds"] for row in rows) / len(rows),
         "lines": round(sum(row["lines"] for row in rows) / len(rows)),
         "bytes": round(sum(row["bytes"] for row in rows) / len(rows)),
     }
     avg = averages[tool]
     print(
         f"  {tool}: "
-        f"{avg['real_seconds']:.6f}s avg, {avg['lines']} lines avg, {avg['bytes']} bytes avg"
+        f"wall {avg['real_seconds']:.6f}s avg | "
+        f"cpu {avg['cpu_seconds']:.6f}s avg "
+        f"(user {avg['user_seconds']:.6f}s + sys {avg['sys_seconds']:.6f}s), "
+        f"{avg['lines']} lines avg, {avg['bytes']} bytes avg"
     )
 
 rs_avg = averages["elasticdump-rs"]["real_seconds"]
 node_avg = averages["elasticdump"]["real_seconds"]
+rs_cpu_avg = averages["elasticdump-rs"]["cpu_seconds"]
+node_cpu_avg = averages["elasticdump"]["cpu_seconds"]
 
 if rs_avg == node_avg:
-    print(
-        f"Headline: elasticdump-rs and elasticdump tied at {rs_avg:.6f}s average wall-clock time"
+    wall_summary = (
+        "Wall-clock: elasticdump-rs and elasticdump tied "
+        f"at {rs_avg:.6f}s average wall-clock time"
     )
 elif rs_avg == 0:
-    print(
-        "Headline: elasticdump-rs completed faster than elasticdump "
+    wall_summary = (
+        "Wall-clock: elasticdump-rs completed faster than elasticdump "
         f"({rs_avg:.6f}s avg vs {node_avg:.6f}s avg)"
     )
 elif node_avg == 0:
-    print(
-        "Headline: elasticdump completed faster than elasticdump-rs "
+    wall_summary = (
+        "Wall-clock: elasticdump completed faster than elasticdump-rs "
         f"({node_avg:.6f}s avg vs {rs_avg:.6f}s avg)"
     )
 elif rs_avg < node_avg:
     speedup = node_avg / rs_avg
-    print(
-        "Headline: elasticdump-rs was "
+    wall_summary = (
+        "Wall-clock: elasticdump-rs was "
         f"{speedup:.2f}x faster than elasticdump "
         f"({rs_avg:.6f}s avg vs {node_avg:.6f}s avg)"
     )
 else:
     speedup = rs_avg / node_avg
-    print(
-        "Headline: elasticdump was "
+    wall_summary = (
+        "Wall-clock: elasticdump was "
         f"{speedup:.2f}x faster than elasticdump-rs "
         f"({node_avg:.6f}s avg vs {rs_avg:.6f}s avg)"
     )
+
+if rs_cpu_avg == node_cpu_avg:
+    cpu_summary = (
+        "CPU total: elasticdump-rs and elasticdump tied "
+        f"at {rs_cpu_avg:.6f}s average CPU time"
+    )
+elif rs_cpu_avg == 0:
+    cpu_summary = (
+        "CPU total: elasticdump-rs used "
+        f"{0.0:.2f}x the CPU time of elasticdump "
+        f"({rs_cpu_avg:.6f}s avg vs {node_cpu_avg:.6f}s avg)"
+    )
+elif node_cpu_avg == 0:
+    cpu_summary = (
+        "CPU total: elasticdump used "
+        f"{0.0:.2f}x the CPU time of elasticdump-rs "
+        f"({node_cpu_avg:.6f}s avg vs {rs_cpu_avg:.6f}s avg)"
+    )
+elif rs_cpu_avg > node_cpu_avg:
+    cpu_ratio = rs_cpu_avg / node_cpu_avg
+    cpu_summary = (
+        "CPU total: elasticdump-rs used "
+        f"{cpu_ratio:.2f}x the CPU time of elasticdump "
+        f"({rs_cpu_avg:.6f}s avg vs {node_cpu_avg:.6f}s avg)"
+    )
+else:
+    cpu_ratio = node_cpu_avg / rs_cpu_avg
+    cpu_summary = (
+        "CPU total: elasticdump used "
+        f"{cpu_ratio:.2f}x the CPU time of elasticdump-rs "
+        f"({node_cpu_avg:.6f}s avg vs {rs_cpu_avg:.6f}s avg)"
+    )
+
+print(wall_summary)
+print(cpu_summary)
 PY
 }
 
