@@ -585,24 +585,10 @@ run_timed_command() {
   local metrics_file="$1"
 
   shift
-  "${PYTHON_BIN}" - "${metrics_file}" "$@" <<'PY'
-import pathlib
-import subprocess
-import sys
-import time
-
-metrics_file = pathlib.Path(sys.argv[1])
-command = sys.argv[2:]
-
-start = time.perf_counter()
-completed = subprocess.run(command, check=False)
-duration = time.perf_counter() - start
-metrics_file.write_text(f"{duration:.6f}\n", encoding="ascii")
-sys.exit(completed.returncode)
-PY
+  /usr/bin/time -p -o "${metrics_file}" "$@"
 }
 
-read_duration_seconds() {
+read_timing_metrics() {
   local metrics_file="$1"
 
   [[ -f "${metrics_file}" ]] || die "Expected metrics file does not exist: ${metrics_file}"
@@ -611,35 +597,59 @@ import pathlib
 import sys
 
 metrics_file = pathlib.Path(sys.argv[1])
-raw = metrics_file.read_text(encoding="ascii").strip()
+values = {"real": [], "user": [], "sys": []}
 
-try:
-    duration = float(raw)
-except ValueError as exc:
-    raise SystemExit(f"Invalid duration in {metrics_file}: {raw}") from exc
+for raw_line in metrics_file.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line:
+        continue
+    key, sep, value = line.partition(" ")
+    if key not in values or not sep:
+        raise SystemExit(f"Invalid timing line in {metrics_file}: {raw_line}")
+    try:
+        parsed = float(value.strip())
+    except ValueError as exc:
+        raise SystemExit(f"Invalid {key} value in {metrics_file}: {value}") from exc
+    values[key].append(parsed)
 
-print(f"{duration:.6f}")
+for key, entries in values.items():
+    if len(entries) != 1:
+        raise SystemExit(
+            f"Expected exactly one {key} entry in {metrics_file}, got {len(entries)}"
+        )
+
+real = values["real"][0]
+user = values["user"][0]
+sys_seconds = values["sys"][0]
+cpu = user + sys_seconds
+print(f"{real:.6f}\t{user:.6f}\t{sys_seconds:.6f}\t{cpu:.6f}")
 PY
 }
 
 write_results_header() {
   local results_file="$1"
 
-  printf 'tool\trun\tduration\tlines\tbytes\n' > "${results_file}"
+  printf 'tool\trun\treal_seconds\tuser_seconds\tsys_seconds\tcpu_seconds\tlines\tbytes\n' > "${results_file}"
 }
 
 append_result() {
   local results_file="$1"
   local tool_name="$2"
   local run_number="$3"
-  local duration="$4"
-  local line_count="$5"
-  local byte_count="$6"
+  local real_seconds="$4"
+  local user_seconds="$5"
+  local sys_seconds="$6"
+  local cpu_seconds="$7"
+  local line_count="$8"
+  local byte_count="$9"
 
-  printf '%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${tool_name}" \
     "${run_number}" \
-    "${duration}" \
+    "${real_seconds}" \
+    "${user_seconds}" \
+    "${sys_seconds}" \
+    "${cpu_seconds}" \
     "${line_count}" \
     "${byte_count}" >> "${results_file}"
 }
@@ -674,21 +684,35 @@ run_one_series_entry() {
   local output_file="$5"
   local metrics_file="$6"
   local results_file="$7"
-  local duration
+  local real_seconds
+  local user_seconds
+  local sys_seconds
+  local cpu_seconds
   local line_count
   local byte_count
+  local timing_fields
 
   shift 7
 
   run_timed_command "${metrics_file}" "$@" || die "${tool_name} ${phase} run ${run_number} failed"
-  duration="$(read_duration_seconds "${metrics_file}")"
+  timing_fields="$(read_timing_metrics "${metrics_file}")"
+  IFS=$'\t' read -r real_seconds user_seconds sys_seconds cpu_seconds <<< "${timing_fields}"
   line_count="$(count_file_lines "${output_file}")"
   byte_count="$(count_file_bytes "${output_file}")"
   validate_line_count "${tool_name}" "${output_file}" "${BENCH_DOCS}" "${line_count}"
-  log_run_metrics "${tool_name}" "${phase}" "${run_number}" "${run_total}" "${duration}" "${line_count}" "${byte_count}"
+  log_run_metrics "${tool_name}" "${phase}" "${run_number}" "${run_total}" "${real_seconds}" "${line_count}" "${byte_count}"
 
   if [[ "${phase}" == "measured" ]]; then
-    append_result "${results_file}" "${tool_name}" "${run_number}" "${duration}" "${line_count}" "${byte_count}"
+    append_result \
+      "${results_file}" \
+      "${tool_name}" \
+      "${run_number}" \
+      "${real_seconds}" \
+      "${user_seconds}" \
+      "${sys_seconds}" \
+      "${cpu_seconds}" \
+      "${line_count}" \
+      "${byte_count}"
   fi
 }
 
@@ -801,7 +825,16 @@ rows_by_tool = {tool: [] for tool in tools}
 
 with open(results_file, "r", encoding="utf-8", newline="") as handle:
     reader = csv.DictReader(handle, delimiter="\t")
-    expected_fields = ["tool", "run", "duration", "lines", "bytes"]
+    expected_fields = [
+        "tool",
+        "run",
+        "real_seconds",
+        "user_seconds",
+        "sys_seconds",
+        "cpu_seconds",
+        "lines",
+        "bytes",
+    ]
     if reader.fieldnames != expected_fields:
         raise SystemExit(
             f"Unexpected results header in {results_file}: {reader.fieldnames!r}"
@@ -814,7 +847,10 @@ with open(results_file, "r", encoding="utf-8", newline="") as handle:
         rows_by_tool[tool].append(
             {
                 "run": int(row["run"]),
-                "duration": float(row["duration"]),
+                "real_seconds": float(row["real_seconds"]),
+                "user_seconds": float(row["user_seconds"]),
+                "sys_seconds": float(row["sys_seconds"]),
+                "cpu_seconds": float(row["cpu_seconds"]),
                 "lines": int(row["lines"]),
                 "bytes": int(row["bytes"]),
             }
@@ -834,7 +870,7 @@ for tool in tools:
     for row in rows_by_tool[tool]:
         print(
             f"  {tool} run {row['run']}: "
-            f"{row['duration']:.6f}s, {row['lines']} lines, {row['bytes']} bytes"
+            f"{row['real_seconds']:.6f}s, {row['lines']} lines, {row['bytes']} bytes"
         )
 
 print("Averages")
@@ -842,22 +878,32 @@ averages = {}
 for tool in tools:
     rows = rows_by_tool[tool]
     averages[tool] = {
-        "duration": sum(row["duration"] for row in rows) / len(rows),
+        "real_seconds": sum(row["real_seconds"] for row in rows) / len(rows),
         "lines": round(sum(row["lines"] for row in rows) / len(rows)),
         "bytes": round(sum(row["bytes"] for row in rows) / len(rows)),
     }
     avg = averages[tool]
     print(
         f"  {tool}: "
-        f"{avg['duration']:.6f}s avg, {avg['lines']} lines avg, {avg['bytes']} bytes avg"
+        f"{avg['real_seconds']:.6f}s avg, {avg['lines']} lines avg, {avg['bytes']} bytes avg"
     )
 
-rs_avg = averages["elasticdump-rs"]["duration"]
-node_avg = averages["elasticdump"]["duration"]
+rs_avg = averages["elasticdump-rs"]["real_seconds"]
+node_avg = averages["elasticdump"]["real_seconds"]
 
 if rs_avg == node_avg:
     print(
         f"Headline: elasticdump-rs and elasticdump tied at {rs_avg:.6f}s average wall-clock time"
+    )
+elif rs_avg == 0:
+    print(
+        "Headline: elasticdump-rs completed faster than elasticdump "
+        f"({rs_avg:.6f}s avg vs {node_avg:.6f}s avg)"
+    )
+elif node_avg == 0:
+    print(
+        "Headline: elasticdump completed faster than elasticdump-rs "
+        f"({node_avg:.6f}s avg vs {rs_avg:.6f}s avg)"
     )
 elif rs_avg < node_avg:
     speedup = node_avg / rs_avg
@@ -925,6 +971,7 @@ main() {
   validate_config
   require_command curl
   require_command mktemp
+  require_command /usr/bin/time
   resolve_python
   setup_runtime
   trap cleanup EXIT
