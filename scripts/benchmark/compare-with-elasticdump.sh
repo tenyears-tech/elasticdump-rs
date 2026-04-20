@@ -604,7 +604,7 @@ main() {
 
   total_runs=$(( BENCH_WARMUP_RUNS + BENCH_MEASURED_RUNS ))
   if (( total_runs == 0 )); then
-    log "No benchmark runs requested"
+    log "No benchmark runs requested; exiting after dataset preparation"
     return 0
   fi
 
