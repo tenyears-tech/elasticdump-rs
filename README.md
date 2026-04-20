@@ -135,12 +135,13 @@ The benchmark script:
 - keeps `elasticdump-rs` on Scroll mode for direct comparability with `elasticdump`
 - treats the first pass for each tool as a warmup by default
 - validates output line counts before reporting a result
-- prints a human-readable per-run summary plus averages and a headline comparison
+- prints a human-readable per-run summary plus averages and headline comparisons for both wall-clock and CPU time
 
 Local prerequisites:
 
 - a reachable Elasticsearch node at `ES_URL` (default `http://localhost:9200`)
 - `elasticdump`
+- `/usr/bin/time`
 - `python3`
 - `curl`
 - a built `elasticdump-rs` release binary or a buildable workspace
@@ -166,7 +167,7 @@ BENCH_KEEP_ARTIFACTS=1 \
 scripts/benchmark/compare-with-elasticdump.sh
 ```
 
-Warmup runs are excluded from the headline result. Only measured runs are recorded in the summary and used for the average wall-clock comparison.
+Warmup runs are excluded from the headline result. Only measured runs are recorded in the summary and used for the average wall-clock and CPU comparisons.
 
 ## Testing
 
