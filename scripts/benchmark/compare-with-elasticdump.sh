@@ -692,109 +692,98 @@ run_one_series_entry() {
   fi
 }
 
-run_elasticdump_rs_series() {
-  local results_file="$1"
-  local run_number
+run_elasticdump_rs_entry() {
+  local phase="$1"
+  local run_number="$2"
+  local run_total="$3"
+  local results_file="$4"
   local output_file
   local metrics_file
   local input_url
 
   input_url="$(es_url "/${BENCH_INDEX}")"
+  output_file="${WORKDIR}/elasticdump-rs.${phase}.${run_number}.jsonl"
+  metrics_file="${WORKDIR}/elasticdump-rs.${phase}.${run_number}.metrics"
 
-  for (( run_number = 1; run_number <= BENCH_WARMUP_RUNS; run_number++ )); do
-    output_file="${WORKDIR}/elasticdump-rs.warmup.${run_number}.jsonl"
-    metrics_file="${WORKDIR}/elasticdump-rs.warmup.${run_number}.metrics"
-    run_one_series_entry \
-      "elasticdump-rs" \
-      "warmup" \
-      "${run_number}" \
-      "${BENCH_WARMUP_RUNS}" \
-      "${output_file}" \
-      "${metrics_file}" \
-      "${results_file}" \
-      "${RS_BIN}" \
-      --input "${input_url}" \
-      --output "${output_file}" \
-      --type data \
-      --limit "${BENCH_LIMIT}" \
-      --scrollTime 10m \
-      --searchType scroll \
-      --overwrite \
-      --quiet
-  done
-
-  for (( run_number = 1; run_number <= BENCH_MEASURED_RUNS; run_number++ )); do
-    output_file="${WORKDIR}/elasticdump-rs.measured.${run_number}.jsonl"
-    metrics_file="${WORKDIR}/elasticdump-rs.measured.${run_number}.metrics"
-    run_one_series_entry \
-      "elasticdump-rs" \
-      "measured" \
-      "${run_number}" \
-      "${BENCH_MEASURED_RUNS}" \
-      "${output_file}" \
-      "${metrics_file}" \
-      "${results_file}" \
-      "${RS_BIN}" \
-      --input "${input_url}" \
-      --output "${output_file}" \
-      --type data \
-      --limit "${BENCH_LIMIT}" \
-      --scrollTime 10m \
-      --searchType scroll \
-      --overwrite \
-      --quiet
-  done
+  run_one_series_entry \
+    "elasticdump-rs" \
+    "${phase}" \
+    "${run_number}" \
+    "${run_total}" \
+    "${output_file}" \
+    "${metrics_file}" \
+    "${results_file}" \
+    "${RS_BIN}" \
+    --input "${input_url}" \
+    --output "${output_file}" \
+    --type data \
+    --limit "${BENCH_LIMIT}" \
+    --scrollTime 10m \
+    --searchType scroll \
+    --overwrite \
+    --quiet
 }
 
-run_elasticdump_series() {
-  local results_file="$1"
-  local run_number
+run_elasticdump_entry() {
+  local phase="$1"
+  local run_number="$2"
+  local run_total="$3"
+  local results_file="$4"
   local output_file
   local metrics_file
   local input_url
 
   input_url="$(es_url "/${BENCH_INDEX}")"
+  output_file="${WORKDIR}/elasticdump.${phase}.${run_number}.jsonl"
+  metrics_file="${WORKDIR}/elasticdump.${phase}.${run_number}.metrics"
+
+  run_one_series_entry \
+    "elasticdump" \
+    "${phase}" \
+    "${run_number}" \
+    "${run_total}" \
+    "${output_file}" \
+    "${metrics_file}" \
+    "${results_file}" \
+    "${ELASTICDUMP_CMD[@]}" \
+    --input "${input_url}" \
+    --output "${output_file}" \
+    --limit "${BENCH_LIMIT}" \
+    --scrollTime 10m \
+    --quiet \
+    --overwrite \
+    --type=data
+}
+
+run_benchmark_round() {
+  local phase="$1"
+  local run_number="$2"
+  local run_total="$3"
+  local results_file="$4"
+  local round_index="$5"
+
+  if (( round_index % 2 == 1 )); then
+    run_elasticdump_rs_entry "${phase}" "${run_number}" "${run_total}" "${results_file}"
+    run_elasticdump_entry "${phase}" "${run_number}" "${run_total}" "${results_file}"
+  else
+    run_elasticdump_entry "${phase}" "${run_number}" "${run_total}" "${results_file}"
+    run_elasticdump_rs_entry "${phase}" "${run_number}" "${run_total}" "${results_file}"
+  fi
+}
+
+run_benchmark_series() {
+  local results_file="$1"
+  local run_number
+  local round_index=1
 
   for (( run_number = 1; run_number <= BENCH_WARMUP_RUNS; run_number++ )); do
-    output_file="${WORKDIR}/elasticdump.warmup.${run_number}.jsonl"
-    metrics_file="${WORKDIR}/elasticdump.warmup.${run_number}.metrics"
-    run_one_series_entry \
-      "elasticdump" \
-      "warmup" \
-      "${run_number}" \
-      "${BENCH_WARMUP_RUNS}" \
-      "${output_file}" \
-      "${metrics_file}" \
-      "${results_file}" \
-      "${ELASTICDUMP_CMD[@]}" \
-      --input "${input_url}" \
-      --output "${output_file}" \
-      --limit "${BENCH_LIMIT}" \
-      --scrollTime 10m \
-      --quiet \
-      --overwrite \
-      --type=data
+    run_benchmark_round "warmup" "${run_number}" "${BENCH_WARMUP_RUNS}" "${results_file}" "${round_index}"
+    round_index=$(( round_index + 1 ))
   done
 
   for (( run_number = 1; run_number <= BENCH_MEASURED_RUNS; run_number++ )); do
-    output_file="${WORKDIR}/elasticdump.measured.${run_number}.jsonl"
-    metrics_file="${WORKDIR}/elasticdump.measured.${run_number}.metrics"
-    run_one_series_entry \
-      "elasticdump" \
-      "measured" \
-      "${run_number}" \
-      "${BENCH_MEASURED_RUNS}" \
-      "${output_file}" \
-      "${metrics_file}" \
-      "${results_file}" \
-      "${ELASTICDUMP_CMD[@]}" \
-      --input "${input_url}" \
-      --output "${output_file}" \
-      --limit "${BENCH_LIMIT}" \
-      --scrollTime 10m \
-      --quiet \
-      --overwrite \
-      --type=data
+    run_benchmark_round "measured" "${run_number}" "${BENCH_MEASURED_RUNS}" "${results_file}" "${round_index}"
+    round_index=$(( round_index + 1 ))
   done
 }
 
@@ -974,8 +963,7 @@ main() {
   results_file="${WORKDIR}/measured-runs.tsv"
   write_results_header "${results_file}"
 
-  run_elasticdump_rs_series "${results_file}"
-  run_elasticdump_series "${results_file}"
+  run_benchmark_series "${results_file}"
 
   if (( BENCH_MEASURED_RUNS > 0 )); then
     print_summary "${results_file}"
