@@ -151,6 +151,8 @@ Typical maintainer run:
 scripts/benchmark/compare-with-elasticdump.sh
 ```
 
+Warning: the default run keeps the seeded benchmark index and generated artifacts because `BENCH_KEEP_ARTIFACTS=1`. If you set `BENCH_INDEX_NAME`, the script will upfront delete/recreate that exact index name before seeding, so use a dedicated benchmark-only name.
+
 Useful environment overrides:
 
 ```bash
