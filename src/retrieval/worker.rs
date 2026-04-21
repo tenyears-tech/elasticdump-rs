@@ -26,6 +26,25 @@ impl WorkerTask {
     }
 }
 
+pub(crate) fn spawn_worker_tasks(
+    worker_rxs: Vec<mpsc::Receiver<RetrievalMessage>>,
+    processed_tx: mpsc::Sender<ExtractedOutputBatch>,
+    processed_count: Arc<AtomicU64>,
+    processed_bytes: Arc<AtomicU64>,
+    output_bar: Option<ProgressBar>,
+    start_time: Instant,
+) -> Result<Vec<WorkerTask>> {
+    spawn_worker_tasks_with(
+        worker_rxs,
+        processed_tx,
+        processed_count,
+        processed_bytes,
+        output_bar,
+        start_time,
+        spawn_worker_task,
+    )
+}
+
 pub(crate) fn spawn_worker_task(
     id: usize,
     rx: mpsc::Receiver<RetrievalMessage>,
@@ -58,6 +77,43 @@ pub(crate) fn spawn_worker_task(
         .map_err(|error| anyhow!("Failed to spawn worker {id} thread: {error}"))?;
 
     Ok(WorkerTask { completion_rx })
+}
+
+fn spawn_worker_tasks_with<F>(
+    worker_rxs: Vec<mpsc::Receiver<RetrievalMessage>>,
+    processed_tx: mpsc::Sender<ExtractedOutputBatch>,
+    processed_count: Arc<AtomicU64>,
+    processed_bytes: Arc<AtomicU64>,
+    output_bar: Option<ProgressBar>,
+    start_time: Instant,
+    mut spawn_worker: F,
+) -> Result<Vec<WorkerTask>>
+where
+    F: FnMut(
+        usize,
+        mpsc::Receiver<RetrievalMessage>,
+        mpsc::Sender<ExtractedOutputBatch>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Option<ProgressBar>,
+        Instant,
+    ) -> Result<WorkerTask>,
+{
+    worker_rxs
+        .into_iter()
+        .enumerate()
+        .map(|(id, rx)| {
+            spawn_worker(
+                id,
+                rx,
+                processed_tx.clone(),
+                Arc::clone(&processed_count),
+                Arc::clone(&processed_bytes),
+                output_bar.clone(),
+                start_time,
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn run_worker_loop(
@@ -118,8 +174,9 @@ fn worker_thread_panic(id: usize, panic_payload: Box<dyn Any + Send>) -> anyhow:
 
 #[cfg(test)]
 mod tests {
-    use super::spawn_worker_task;
+    use super::{WorkerTask, spawn_worker_task, spawn_worker_tasks_with};
     use crate::retrieval::messages::RetrievalMessage;
+    use anyhow::anyhow;
     use std::{
         sync::{
             Arc,
@@ -186,5 +243,43 @@ mod tests {
 
         handle.wait().await.unwrap();
         assert!(processed_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_worker_tasks_reports_start_failure() {
+        let (_tx0, rx0) = mpsc::channel(1);
+        let (_tx1, rx1) = mpsc::channel(1);
+        let (processed_tx, _processed_rx) = mpsc::channel(1);
+
+        let result = spawn_worker_tasks_with(
+            vec![rx0, rx1],
+            processed_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Instant::now(),
+            |id,
+             _rx,
+             _processed_tx,
+             _processed_count,
+             _processed_bytes,
+             _output_bar,
+             _start_time| {
+                if id == 1 {
+                    return Err(anyhow!("injected worker start failure"));
+                }
+
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                let _ = completion_tx.send(Ok(()));
+                Ok(WorkerTask { completion_rx })
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("worker startup unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("injected worker start failure"));
     }
 }

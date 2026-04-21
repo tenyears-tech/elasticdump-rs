@@ -39,9 +39,6 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     // Prepare search body from user input
     let search_body = search_body::prepare_search_body(&args).await?;
 
-    // Create the output target only after input validation succeeds.
-    let output_target = crate::output::create_output_target(&args).await?;
-
     // Create channels for the pipeline
     let workers = args.workers;
     let buffer_size = args.buffer_size;
@@ -88,11 +85,47 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     let mut estimated_total_hits = 0u64;
     let mut total_hits_are_exact = true;
 
+    // Start worker tasks before any staged output or retrieval work begins.
+    let worker_tasks = worker::spawn_worker_tasks(
+        worker_rxs,
+        processed_tx.clone(),
+        Arc::clone(&processed_count),
+        Arc::clone(&processed_bytes),
+        output_bar.clone(),
+        start_time,
+    )?;
+
     let shared_pit = if matches!(args.search_type, SearchType::PointInTime) {
         Some(SharedPitCoordinator::open(client, index, &args.pit_keep_alive, num_slices).await?)
     } else {
         None
     };
+
+    // Create the output target only after input validation and worker startup succeed.
+    let output_target = crate::output::create_output_target(&args).await?;
+
+    // Drop the sender to signal no more processing will happen after worker clones are done.
+    drop(processed_tx);
+
+    // Output task
+    let output_task = tokio::spawn(async move {
+        let mut output_target = output_target;
+
+        // Process output as it comes in
+        while let Some(processed) = processed_rx.recv().await {
+            // Write the entire buffer from the processed batch
+            if let Err(e) = output_target.write_all(&processed.buffer).await {
+                output_target.abort().await;
+                return Err(anyhow::anyhow!("Failed to write batch buffer: {}", e));
+            }
+        }
+
+        if let Err(e) = output_target.flush().await {
+            output_target.abort().await;
+            return Err(anyhow::anyhow!("Failed to flush writer: {}", e));
+        }
+        Ok(output_target)
+    });
 
     let total_hits_count = Arc::new(AtomicU64::new(0));
     let ctx = RetrievalContext {
@@ -141,46 +174,6 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
 
         retrieval_tasks.push(task);
     }
-
-    // Start worker tasks
-    let worker_tasks: Vec<_> = worker_rxs
-        .into_iter()
-        .enumerate()
-        .map(|(id, rx)| {
-            worker::spawn_worker_task(
-                id,
-                rx,
-                processed_tx.clone(),
-                Arc::clone(&processed_count),
-                Arc::clone(&processed_bytes),
-                output_bar.clone(),
-                start_time,
-            )
-        })
-        .collect::<Result<_>>()?;
-
-    // Drop the sender to signal no more processing will happen
-    drop(processed_tx);
-
-    // Output task
-    let output_task = tokio::spawn(async move {
-        let mut output_target = output_target;
-
-        // Process output as it comes in
-        while let Some(processed) = processed_rx.recv().await {
-            // Write the entire buffer from the processed batch
-            if let Err(e) = output_target.write_all(&processed.buffer).await {
-                output_target.abort().await;
-                return Err(anyhow::anyhow!("Failed to write batch buffer: {}", e));
-            }
-        }
-
-        if let Err(e) = output_target.flush().await {
-            output_target.abort().await;
-            return Err(anyhow::anyhow!("Failed to flush writer: {}", e));
-        }
-        Ok(output_target)
-    });
 
     let mut pipeline_error = None;
 
