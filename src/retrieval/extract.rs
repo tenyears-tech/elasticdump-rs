@@ -79,7 +79,11 @@ pub(crate) fn extract_batch_metadata(
         if matches!(search_type, SearchType::PointInTime) {
             last_sort_raw = hit
                 .get("sort")
-                .map(|value| value.as_raw_str().as_bytes().to_vec());
+                .and_then(|value| {
+                    value
+                        .is_array()
+                        .then(|| value.as_raw_str().as_bytes().to_vec())
+                });
         }
     }
 
@@ -194,6 +198,28 @@ mod tests {
             Some(br#"[2,"b"]"#.as_slice())
         );
         assert_eq!(metadata.doc_count, 2);
+    }
+
+    #[test]
+    fn extract_batch_metadata_rejects_non_usable_final_pit_sort() {
+        let response = Bytes::from_static(
+            br#"{
+                "pit_id":"pit-next",
+                "hits":{
+                    "total":{"value":2,"relation":"eq"},
+                    "hits":[
+                        {"_id":"1","sort":[1,"a"],"_source":{"name":"a"}},
+                        {"_id":"2","sort":null,"_source":{"name":"b"}}
+                    ]
+                }
+            }"#,
+        );
+
+        let error = extract_batch_metadata(&response, &SearchType::PointInTime)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("usable sort value"));
     }
 
     #[test]
