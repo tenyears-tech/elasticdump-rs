@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
 use bytesize::ByteSize;
 use elasticsearch::{ClearScrollParts, Elasticsearch, http::response::Response};
+use http::StatusCode;
 use log::warn;
 use sonic_rs::{JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value, json};
 use std::sync::{Arc, atomic::Ordering};
@@ -34,7 +36,7 @@ pub(crate) async fn read_checked_response_bytes(
     response: Response,
     slice_id: usize,
     operation: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     let status = response.status_code();
     let response_bytes = response.bytes().await.map_err(|e| {
         anyhow!(
@@ -44,10 +46,18 @@ pub(crate) async fn read_checked_response_bytes(
             e
         )
     })?;
-    let response_bytes = response_bytes.to_vec();
 
+    validate_response_bytes(status, response_bytes, slice_id, operation)
+}
+
+pub(crate) fn validate_response_bytes(
+    status: StatusCode,
+    response_bytes: Bytes,
+    slice_id: usize,
+    operation: &str,
+) -> Result<Bytes> {
     if !status.is_success() {
-        let response_body = String::from_utf8_lossy(&response_bytes);
+        let response_body = String::from_utf8_lossy(response_bytes.as_ref());
         return Err(anyhow!(
             "Slice {}: Elasticsearch {} failed with HTTP {}: {}",
             slice_id,
@@ -206,6 +216,8 @@ pub fn spawn_retrieval_task(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use http::StatusCode;
     use sonic_rs::json;
 
     #[test]
@@ -299,5 +311,33 @@ mod tests {
                 is_exact: true,
             }
         );
+    }
+
+    #[test]
+    fn validate_response_bytes_preserves_success_buffer() {
+        let body = Bytes::from_static(br#"{"hits":{"hits":[]}}"#);
+        let original_ptr = body.as_ptr();
+
+        let returned =
+            super::validate_response_bytes(StatusCode::OK, body, 0, "initial search").unwrap();
+
+        assert_eq!(returned.as_ptr(), original_ptr);
+        assert_eq!(returned, Bytes::from_static(br#"{"hits":{"hits":[]}}"#));
+    }
+
+    #[test]
+    fn validate_response_bytes_reports_http_error_body() {
+        let error = super::validate_response_bytes(
+            StatusCode::NOT_FOUND,
+            Bytes::from_static(br#"{"error":"missing"}"#),
+            3,
+            "continuation search",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Slice 3"));
+        assert!(error.contains("HTTP 404"));
+        assert!(error.contains(r#"{"error":"missing"}"#));
     }
 }
