@@ -5,7 +5,7 @@ use elasticsearch::{ClearScrollParts, Elasticsearch, http::response::Response};
 use http::StatusCode;
 use log::warn;
 use sonic_rs::{JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value, json};
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::atomic::Ordering;
 
 use super::{
     context::RetrievalContext, messages::RetrievalMessage, pit::SharedPitCoordinator, pit_search,
@@ -132,16 +132,13 @@ pub(crate) fn record_total_hits(
 pub(crate) async fn dispatch_response_batch(
     ctx: &RetrievalContext,
     state: &mut SliceState,
-    response: Arc<Value>,
+    response_bytes: Bytes,
+    doc_count: u64,
+    hits_are_empty: bool,
     batch_bytes: u64,
 ) -> Result<bool> {
-    let hits = response["hits"]["hits"].as_array();
-    let hits_are_empty = hits.is_none_or(|items| items.is_empty());
-    let batch_size = hits.map_or(0, |items| items.len() as u64);
-
-    state.retrieved_hits += batch_size;
-    let current_retrieved =
-        ctx.retrieved_count.fetch_add(batch_size, Ordering::Relaxed) + batch_size;
+    state.retrieved_hits += doc_count;
+    let current_retrieved = ctx.retrieved_count.fetch_add(doc_count, Ordering::Relaxed) + doc_count;
     let current_bytes = ctx
         .retrieved_bytes
         .fetch_add(batch_bytes, Ordering::Relaxed)
@@ -157,9 +154,13 @@ pub(crate) async fn dispatch_response_batch(
         ));
     }
 
+    if doc_count == 0 {
+        return Ok(hits_are_empty);
+    }
+
     let worker = state.dispatch_worker(ctx.worker_txs.len());
     ctx.worker_txs[worker]
-        .send(RetrievalMessage::Batch(response))
+        .send(RetrievalMessage::Batch(response_bytes))
         .await
         .map_err(|error| {
             anyhow!(
@@ -219,6 +220,36 @@ mod tests {
     use bytes::Bytes;
     use http::StatusCode;
     use sonic_rs::json;
+    use std::{
+        sync::{Arc, atomic::AtomicU64},
+        time::Instant,
+    };
+    use tokio::sync::mpsc;
+    use url::Url;
+
+    use super::super::{
+        context::RetrievalContext, messages::RetrievalMessage, slice_state::SliceState,
+    };
+
+    fn test_context(worker_txs: Vec<mpsc::Sender<RetrievalMessage>>) -> RetrievalContext {
+        RetrievalContext {
+            client: crate::elasticsearch::create_client(
+                Url::parse("http://localhost:9200/").unwrap(),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+            index: Arc::<str>::from("test-index"),
+            worker_txs,
+            total_hits_count: Arc::new(AtomicU64::new(0)),
+            input_bar: None,
+            output_bar: None,
+            retrieved_count: Arc::new(AtomicU64::new(0)),
+            retrieved_bytes: Arc::new(AtomicU64::new(0)),
+            start_time: Instant::now(),
+        }
+    }
 
     #[test]
     fn latest_pit_id_prefers_search_response_id() {
@@ -339,5 +370,32 @@ mod tests {
         assert!(error.contains("Slice 3"));
         assert!(error.contains("HTTP 404"));
         assert!(error.contains(r#"{"error":"missing"}"#));
+    }
+
+    #[tokio::test]
+    async fn dispatch_response_batch_skips_empty_batches() {
+        let (worker_tx, mut worker_rx) = mpsc::channel(1);
+        let ctx = test_context(vec![worker_tx]);
+        let mut state = SliceState::new(0, 0, json!({"size": 10}));
+        let response_bytes = Bytes::from_static(br#"{"hits":{"hits":[]}}"#);
+
+        let hits_are_empty =
+            super::dispatch_response_batch(&ctx, &mut state, response_bytes, 0, true, 19)
+                .await
+                .unwrap();
+
+        assert!(hits_are_empty);
+        assert_eq!(state.retrieved_hits, 0);
+        assert_eq!(
+            ctx.retrieved_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            ctx.retrieved_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            19
+        );
+        assert!(worker_rx.try_recv().is_err());
     }
 }

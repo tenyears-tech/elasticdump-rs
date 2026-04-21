@@ -155,10 +155,10 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
             tokio::spawn(async move {
                 while let Some(message) = rx.recv().await {
                     match message {
-                        RetrievalMessage::Batch(batch) => {
+                        RetrievalMessage::Batch(response_bytes) => {
                             // Move CPU-bound work to blocking thread pool
                             let processed = tokio::task::spawn_blocking(move || {
-                                crate::processing::process_batch(&batch)
+                                crate::retrieval::extract::build_output_batch(&response_bytes)
                             })
                             .await??;
 

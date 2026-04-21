@@ -1,7 +1,6 @@
 pub mod cli;
 pub mod elasticsearch;
 pub mod output;
-pub mod processing;
 pub mod retrieval;
 
 pub async fn run() -> anyhow::Result<()> {

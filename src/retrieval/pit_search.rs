@@ -2,7 +2,6 @@ use anyhow::{Result, anyhow};
 use elasticsearch::SearchParts;
 use log::{debug, info};
 use sonic_rs::{JsonContainerTrait, JsonValueMutTrait, Value, json};
-use std::sync::Arc;
 
 use super::{
     context::RetrievalContext,
@@ -114,30 +113,36 @@ pub(crate) async fn run_pit_slice(
         state.slice_id, slice_total_hits.value, slice_total_hits.is_exact
     );
 
-    let response_data = Arc::new(search_response);
-    state.current_id = latest_pit_id(response_data.as_ref());
-    state.update_search_after_from_hits(
-        response_data["hits"]["hits"]
-            .as_array()
-            .map(|items| &items[..]),
-    );
+    let hits = search_response["hits"]["hits"].as_array();
+    let doc_count = hits.map_or(0, |items| items.len() as u64);
+    let hits_are_empty = hits.is_none_or(|items| items.is_empty());
+    state.current_id = latest_pit_id(&search_response);
+    state.update_search_after_from_hits(hits.map(|items| &items[..]));
     shared_pit
         .observe_returned_id(state.current_id.as_deref())
         .await;
 
-    let initial_hits_are_empty =
-        match dispatch_response_batch(ctx, state, response_data.clone(), initial_bytes).await {
-            Ok(hits_are_empty) => hits_are_empty,
-            Err(error) => {
-                abort_shared_pit(&Some(shared_pit.clone()), &anyhow!(error.to_string())).await;
-                return Err(error);
-            }
-        };
+    let initial_hits_are_empty = match dispatch_response_batch(
+        ctx,
+        state,
+        response_bytes,
+        doc_count,
+        hits_are_empty,
+        initial_bytes,
+    )
+    .await
+    {
+        Ok(hits_are_empty) => hits_are_empty,
+        Err(error) => {
+            abort_shared_pit(&Some(shared_pit.clone()), &anyhow!(error.to_string())).await;
+            return Err(error);
+        }
+    };
 
     if let Err(error) = shared_pit
         .complete_round(
             state.pit_generation.expect("PIT generation should be set"),
-            latest_pit_id(response_data.as_ref()),
+            state.current_id.clone(),
             initial_hits_are_empty,
         )
         .await
@@ -242,21 +247,30 @@ pub(crate) async fn run_pit_slice(
         );
 
         state.current_id = latest_pit_id(&next_json);
-        state.update_search_after_from_hits(
-            next_json["hits"]["hits"].as_array().map(|items| &items[..]),
-        );
+        let hits = next_json["hits"]["hits"].as_array();
+        let doc_count = hits.map_or(0, |items| items.len() as u64);
+        let hits_are_empty = hits.is_none_or(|items| items.is_empty());
+        state.update_search_after_from_hits(hits.map(|items| &items[..]));
         shared_pit
             .observe_returned_id(state.current_id.as_deref())
             .await;
 
-        let hits_are_empty =
-            match dispatch_response_batch(ctx, state, Arc::new(next_json), batch_bytes).await {
-                Ok(hits_are_empty) => hits_are_empty,
-                Err(error) => {
-                    abort_shared_pit(&Some(shared_pit.clone()), &anyhow!(error.to_string())).await;
-                    return Err(error);
-                }
-            };
+        let hits_are_empty = match dispatch_response_batch(
+            ctx,
+            state,
+            next_response_bytes,
+            doc_count,
+            hits_are_empty,
+            batch_bytes,
+        )
+        .await
+        {
+            Ok(hits_are_empty) => hits_are_empty,
+            Err(error) => {
+                abort_shared_pit(&Some(shared_pit.clone()), &anyhow!(error.to_string())).await;
+                return Err(error);
+            }
+        };
 
         if let Err(error) = shared_pit
             .complete_round(

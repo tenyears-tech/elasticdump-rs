@@ -1,9 +1,8 @@
-use sonic_rs::Value;
-use std::sync::Arc;
+use bytes::Bytes;
 
 /// Define message types for our channels
 #[derive(Clone)]
 pub enum RetrievalMessage {
-    Batch(Arc<Value>),
+    Batch(Bytes),
     Done,
 }

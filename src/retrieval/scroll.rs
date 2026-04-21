@@ -1,8 +1,7 @@
 use anyhow::{Result, anyhow};
 use elasticsearch::{ScrollParts, SearchParts};
 use log::{debug, info};
-use sonic_rs::{Value, json};
-use std::sync::Arc;
+use sonic_rs::{JsonContainerTrait, Value, json};
 
 use crate::cli::SearchType;
 
@@ -89,23 +88,29 @@ pub(crate) async fn run_scroll_slice(
         "Slice {}: Total hits estimate: {} (exact: {})",
         state.slice_id, slice_total_hits.value, slice_total_hits.is_exact
     );
+    let hits = search_response["hits"]["hits"].as_array();
+    let doc_count = hits.map_or(0, |items| items.len() as u64);
+    let hits_are_empty = hits.is_none_or(|items| items.is_empty());
 
-    let mut done =
-        match dispatch_response_batch(ctx, state, Arc::new(search_response), initial_bytes).await {
-            Ok(hits_are_empty) => hits_are_empty,
-            Err(error) => {
-                if let Some(scroll_id) = state.current_id.as_deref() {
-                    cleanup_search_context(
-                        &ctx.client,
-                        &SearchType::Scroll,
-                        scroll_id,
-                        state.slice_id,
-                    )
+    let mut done = match dispatch_response_batch(
+        ctx,
+        state,
+        response_bytes,
+        doc_count,
+        hits_are_empty,
+        initial_bytes,
+    )
+    .await
+    {
+        Ok(hits_are_empty) => hits_are_empty,
+        Err(error) => {
+            if let Some(scroll_id) = state.current_id.as_deref() {
+                cleanup_search_context(&ctx.client, &SearchType::Scroll, scroll_id, state.slice_id)
                     .await;
-                }
-                return Err(error);
             }
-        };
+            return Err(error);
+        }
+    };
 
     while !done {
         let next_response = match ctx
@@ -200,8 +205,20 @@ pub(crate) async fn run_scroll_slice(
         if let Some(current_id) = state.current_id.as_mut() {
             refresh_search_id(&SearchType::Scroll, &next_json, current_id);
         }
+        let hits = next_json["hits"]["hits"].as_array();
+        let doc_count = hits.map_or(0, |items| items.len() as u64);
+        let hits_are_empty = hits.is_none_or(|items| items.is_empty());
 
-        done = match dispatch_response_batch(ctx, state, Arc::new(next_json), batch_bytes).await {
+        done = match dispatch_response_batch(
+            ctx,
+            state,
+            next_response_bytes,
+            doc_count,
+            hits_are_empty,
+            batch_bytes,
+        )
+        .await
+        {
             Ok(hits_are_empty) => hits_are_empty,
             Err(error) => {
                 if let Some(scroll_id) = state.current_id.as_deref() {
