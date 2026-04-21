@@ -2,15 +2,29 @@ use anyhow::{Result, anyhow};
 use bytesize::ByteSize;
 use indicatif::ProgressBar;
 use std::{
+    any::Any,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
     time::Instant,
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::sync::{mpsc, oneshot};
 
 use super::{extract::ExtractedOutputBatch, messages::RetrievalMessage};
+
+pub(crate) struct WorkerTask {
+    completion_rx: oneshot::Receiver<Result<()>>,
+}
+
+impl WorkerTask {
+    pub(crate) async fn wait(self) -> Result<()> {
+        self.completion_rx
+            .await
+            .map_err(|_| anyhow!("Worker completion channel closed before reporting status"))?
+    }
+}
 
 pub(crate) fn spawn_worker_task(
     id: usize,
@@ -20,18 +34,30 @@ pub(crate) fn spawn_worker_task(
     processed_bytes: Arc<AtomicU64>,
     output_bar: Option<ProgressBar>,
     start_time: Instant,
-) -> JoinHandle<Result<()>> {
-    tokio::task::spawn_blocking(move || {
-        run_worker_loop(
-            id,
-            rx,
-            processed_tx,
-            processed_count,
-            processed_bytes,
-            output_bar,
-            start_time,
-        )
-    })
+) -> Result<WorkerTask> {
+    let (completion_tx, completion_rx) = oneshot::channel();
+
+    thread::Builder::new()
+        .name(format!("retrieval-worker-{id}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_worker_loop(
+                    id,
+                    rx,
+                    processed_tx,
+                    processed_count,
+                    processed_bytes,
+                    output_bar,
+                    start_time,
+                )
+            }))
+            .unwrap_or_else(|panic_payload| Err(worker_thread_panic(id, panic_payload)));
+
+            let _ = completion_tx.send(result);
+        })
+        .map_err(|error| anyhow!("Failed to spawn worker {id} thread: {error}"))?;
+
+    Ok(WorkerTask { completion_rx })
 }
 
 pub(crate) fn run_worker_loop(
@@ -78,9 +104,21 @@ pub(crate) fn run_worker_loop(
     Ok(())
 }
 
+fn worker_thread_panic(id: usize, panic_payload: Box<dyn Any + Send>) -> anyhow::Error {
+    let panic_message = if let Some(message) = panic_payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic_payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    };
+
+    anyhow!("Worker {id} thread panicked: {panic_message}")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::run_worker_loop;
+    use super::spawn_worker_task;
     use crate::retrieval::messages::RetrievalMessage;
     use std::{
         sync::{
@@ -98,21 +136,16 @@ mod tests {
 
         let processed_count = Arc::new(AtomicU64::new(0));
         let processed_bytes = Arc::new(AtomicU64::new(0));
-        let handle = tokio::task::spawn_blocking({
-            let processed_count = Arc::clone(&processed_count);
-            let processed_bytes = Arc::clone(&processed_bytes);
-            move || {
-                run_worker_loop(
-                    0,
-                    rx,
-                    processed_tx,
-                    processed_count,
-                    processed_bytes,
-                    None,
-                    Instant::now(),
-                )
-            }
-        });
+        let handle = spawn_worker_task(
+            0,
+            rx,
+            processed_tx,
+            Arc::clone(&processed_count),
+            Arc::clone(&processed_bytes),
+            None,
+            Instant::now(),
+        )
+        .unwrap();
 
         tx.send(RetrievalMessage::Batch(bytes::Bytes::from_static(
             br#"{"hits":{"hits":[{"_id":"1","_source":{"message":"a"}}]}}"#,
@@ -128,7 +161,7 @@ mod tests {
             "{\"_id\":\"1\",\"_source\":{\"message\":\"a\"}}\n"
         );
 
-        handle.await.unwrap().unwrap();
+        handle.wait().await.unwrap();
         assert_eq!(processed_count.load(Ordering::Relaxed), 1);
         assert!(processed_bytes.load(Ordering::Relaxed) > 0);
     }
@@ -138,21 +171,20 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let (processed_tx, mut processed_rx) = mpsc::channel(1);
 
-        let handle = tokio::task::spawn_blocking(move || {
-            run_worker_loop(
-                1,
-                rx,
-                processed_tx,
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicU64::new(0)),
-                None,
-                Instant::now(),
-            )
-        });
+        let handle = spawn_worker_task(
+            1,
+            rx,
+            processed_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Instant::now(),
+        )
+        .unwrap();
 
         tx.send(RetrievalMessage::Done).await.unwrap();
 
-        handle.await.unwrap().unwrap();
+        handle.wait().await.unwrap();
         assert!(processed_rx.try_recv().is_err());
     }
 }

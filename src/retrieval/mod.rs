@@ -157,7 +157,7 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
                 start_time,
             )
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Drop the sender to signal no more processing will happen
     drop(processed_tx);
@@ -269,17 +269,9 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
 
     // Wait for all workers to finish
     for (i, task) in worker_tasks.into_iter().enumerate() {
-        match task.await {
-            Ok(Ok(())) => {} // Worker finished successfully
-            Ok(Err(e)) => {
-                if pipeline_error.is_none() {
-                    pipeline_error = Some(anyhow::anyhow!("Worker {} processing failed: {}", i, e));
-                }
-            }
-            Err(e) => {
-                if pipeline_error.is_none() {
-                    pipeline_error = Some(anyhow::anyhow!("Worker {} task panicked: {}", i, e));
-                }
+        if let Err(e) = task.wait().await {
+            if pipeline_error.is_none() {
+                pipeline_error = Some(anyhow::anyhow!("Worker {} processing failed: {}", i, e));
             }
         }
     }
