@@ -562,6 +562,8 @@ async fn test_scroll_dump_preserves_full_hit_documents() -> Result<()> {
         "data",
         "--searchType",
         "scroll",
+        "--limit",
+        "10",
         "--quiet",
     ])?;
 

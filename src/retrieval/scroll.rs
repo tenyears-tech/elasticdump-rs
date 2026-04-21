@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use elasticsearch::{ScrollParts, SearchParts};
+use elasticsearch::{Elasticsearch, ScrollParts, SearchParts};
 use log::{debug, info};
 use sonic_rs::{Value, json};
 
@@ -24,6 +24,23 @@ pub(crate) fn build_scroll_request_body(scroll_ttl: &str, scroll_id: &str) -> Va
 
 pub(crate) fn apply_scroll_batch_metadata(state: &mut SliceState, metadata: &BatchMetadata) {
     state.current_id = metadata.next_scroll_id.clone();
+}
+
+pub(crate) async fn extract_scroll_batch_metadata(
+    client: &Elasticsearch,
+    slice_id: usize,
+    current_scroll_id: Option<&str>,
+    response_bytes: &bytes::Bytes,
+) -> Result<BatchMetadata> {
+    match super::extract::extract_batch_metadata(response_bytes, &SearchType::Scroll) {
+        Ok(metadata) => Ok(metadata),
+        Err(error) => {
+            if let Some(scroll_id) = current_scroll_id {
+                cleanup_search_context(client, &SearchType::Scroll, scroll_id, slice_id).await;
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(crate) async fn run_scroll_slice(
@@ -68,7 +85,8 @@ pub(crate) async fn run_scroll_slice(
         state.slice_id, initial_bytes
     );
 
-    let metadata = super::extract::extract_batch_metadata(&response_bytes, &SearchType::Scroll)?;
+    let metadata =
+        extract_scroll_batch_metadata(&ctx.client, state.slice_id, None, &response_bytes).await?;
     apply_scroll_batch_metadata(state, &metadata);
     if let Some(id) = &state.current_id {
         debug!("Slice {}: Got scroll_id: {}", state.slice_id, id);
@@ -166,8 +184,13 @@ pub(crate) async fn run_scroll_slice(
             state.slice_id, batch_bytes
         );
 
-        let metadata =
-            super::extract::extract_batch_metadata(&next_response_bytes, &SearchType::Scroll)?;
+        let metadata = extract_scroll_batch_metadata(
+            &ctx.client,
+            state.slice_id,
+            state.current_id.as_deref(),
+            &next_response_bytes,
+        )
+        .await?;
         apply_scroll_batch_metadata(state, &metadata);
 
         done = match dispatch_response_batch(
