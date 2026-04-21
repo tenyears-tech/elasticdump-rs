@@ -8,6 +8,7 @@ mod retrieval_task;
 mod scroll;
 mod search_body;
 mod slice_state;
+mod worker;
 
 use anyhow::Result;
 use bytesize::ByteSize;
@@ -145,62 +146,16 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     let worker_tasks: Vec<_> = worker_rxs
         .into_iter()
         .enumerate()
-        .map(|(id, mut rx)| {
-            let processed_tx = processed_tx.clone();
-            let processed_count = Arc::clone(&processed_count);
-            let processed_bytes = Arc::clone(&processed_bytes);
-            let output_bar = output_bar.clone();
-            let start_time = start_time.clone();
-
-            tokio::spawn(async move {
-                while let Some(message) = rx.recv().await {
-                    match message {
-                        RetrievalMessage::Batch(response_bytes) => {
-                            // Move CPU-bound work to blocking thread pool
-                            let processed = tokio::task::spawn_blocking(move || {
-                                crate::retrieval::extract::build_output_batch(&response_bytes)
-                            })
-                            .await??;
-
-                            // Update counters
-                            let doc_count = processed.doc_count;
-                            let bytes_count = processed.buffer.len() as u64;
-
-                            processed_count.fetch_add(doc_count, Ordering::Relaxed);
-                            processed_bytes.fetch_add(bytes_count, Ordering::Relaxed);
-
-                            // Update progress bar
-                            if let Some(ob) = &output_bar {
-                                let current = processed_count.load(Ordering::Relaxed);
-                                ob.set_position(current);
-
-                                let bytes = processed_bytes.load(Ordering::Relaxed);
-                                let elapsed_secs = start_time.elapsed().as_secs_f64().max(1e-6);
-                                let bytes_per_sec = bytes as f64 / elapsed_secs;
-                                ob.set_message(format!(
-                                    "{} @ {} /s",
-                                    ByteSize(bytes),
-                                    ByteSize(bytes_per_sec as u64)
-                                ));
-                            }
-
-                            // Send to output channel
-                            if let Err(e) = processed_tx.send(processed).await {
-                                return Err(anyhow::anyhow!(
-                                    "Worker {}: Failed to send processed batch: {}",
-                                    id,
-                                    e
-                                ));
-                            }
-                        }
-                        RetrievalMessage::Done => {
-                            // This worker is done
-                            break;
-                        }
-                    }
-                }
-                Ok(())
-            })
+        .map(|(id, rx)| {
+            worker::spawn_worker_task(
+                id,
+                rx,
+                processed_tx.clone(),
+                Arc::clone(&processed_count),
+                Arc::clone(&processed_bytes),
+                output_bar.clone(),
+                start_time,
+            )
         })
         .collect();
 
