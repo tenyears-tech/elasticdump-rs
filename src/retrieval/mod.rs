@@ -32,20 +32,38 @@ use self::pit::SharedPitCoordinator;
 use self::progress::setup_progress_bars;
 use self::slice_state::SliceState;
 
-async fn create_output_target_and_shared_pit<O, P, OutputFut, PitFut, OutputFactory, PitFactory>(
+async fn create_output_target_and_shared_pit<
+    O,
+    P,
+    OutputFut,
+    AbortFut,
+    PitFut,
+    OutputFactory,
+    AbortFactory,
+    PitFactory,
+>(
     search_type: &SearchType,
     create_output_target: OutputFactory,
+    abort_output_target: AbortFactory,
     open_shared_pit: PitFactory,
 ) -> Result<(O, Option<P>)>
 where
     OutputFut: Future<Output = Result<O>>,
+    AbortFut: Future<Output = ()>,
     PitFut: Future<Output = Result<P>>,
     OutputFactory: FnOnce() -> OutputFut,
+    AbortFactory: FnOnce(O) -> AbortFut,
     PitFactory: FnOnce() -> PitFut,
 {
     let output_target = create_output_target().await?;
     let shared_pit = if matches!(search_type, SearchType::PointInTime) {
-        Some(open_shared_pit().await?)
+        match open_shared_pit().await {
+            Ok(shared_pit) => Some(shared_pit),
+            Err(error) => {
+                abort_output_target(output_target).await;
+                return Err(error);
+            }
+        }
     } else {
         None
     };
@@ -120,6 +138,7 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     let (output_target, shared_pit) = create_output_target_and_shared_pit(
         &args.search_type,
         || crate::output::create_output_target(&args),
+        |output_target| async move { output_target.abort().await },
         || SharedPitCoordinator::open(client, index, &args.pit_keep_alive, num_slices),
     )
     .await?;
@@ -392,12 +411,13 @@ mod tests {
         let error = create_output_target_and_shared_pit(
             &crate::cli::SearchType::PointInTime,
             || async { Err::<(), anyhow::Error>(anyhow!("output target failed")) },
+            |_output_target| async {},
             {
                 let pit_opened = Arc::clone(&pit_opened);
                 move || async move {
-                    pit_opened.store(true, Ordering::Relaxed);
-                    Ok::<_, anyhow::Error>("pit-opened")
-                }
+                        pit_opened.store(true, Ordering::Relaxed);
+                        Ok::<_, anyhow::Error>("pit-opened")
+                    }
             },
         )
         .await
@@ -406,5 +426,28 @@ mod tests {
 
         assert!(error.contains("output target failed"));
         assert!(!pit_opened.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn create_output_target_and_shared_pit_aborts_output_when_pit_open_fails() {
+        let output_aborted = Arc::new(AtomicBool::new(false));
+
+        let error = create_output_target_and_shared_pit(
+            &crate::cli::SearchType::PointInTime,
+            || async { Ok::<_, anyhow::Error>("output-target") },
+            {
+                let output_aborted = Arc::clone(&output_aborted);
+                move |_output_target| async move {
+                    output_aborted.store(true, Ordering::Relaxed);
+                }
+            },
+            || async { Err::<&'static str, anyhow::Error>(anyhow!("pit open failed")) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("pit open failed"));
+        assert!(output_aborted.load(Ordering::Relaxed));
     }
 }
