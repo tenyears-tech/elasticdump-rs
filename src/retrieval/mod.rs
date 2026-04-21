@@ -16,6 +16,7 @@ use elasticsearch::Elasticsearch;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use log::{debug, info};
 use sonic_rs::{JsonValueMutTrait, json};
+use std::future::Future;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -30,6 +31,27 @@ use self::messages::RetrievalMessage;
 use self::pit::SharedPitCoordinator;
 use self::progress::setup_progress_bars;
 use self::slice_state::SliceState;
+
+async fn create_output_target_and_shared_pit<O, P, OutputFut, PitFut, OutputFactory, PitFactory>(
+    search_type: &SearchType,
+    create_output_target: OutputFactory,
+    open_shared_pit: PitFactory,
+) -> Result<(O, Option<P>)>
+where
+    OutputFut: Future<Output = Result<O>>,
+    PitFut: Future<Output = Result<P>>,
+    OutputFactory: FnOnce() -> OutputFut,
+    PitFactory: FnOnce() -> PitFut,
+{
+    let output_target = create_output_target().await?;
+    let shared_pit = if matches!(search_type, SearchType::PointInTime) {
+        Some(open_shared_pit().await?)
+    } else {
+        None
+    };
+
+    Ok((output_target, shared_pit))
+}
 
 /// Main function to dump data from Elasticsearch
 pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result<()> {
@@ -95,14 +117,12 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         start_time,
     )?;
 
-    let shared_pit = if matches!(args.search_type, SearchType::PointInTime) {
-        Some(SharedPitCoordinator::open(client, index, &args.pit_keep_alive, num_slices).await?)
-    } else {
-        None
-    };
-
-    // Create the output target only after input validation and worker startup succeed.
-    let output_target = crate::output::create_output_target(&args).await?;
+    let (output_target, shared_pit) = create_output_target_and_shared_pit(
+        &args.search_type,
+        || crate::output::create_output_target(&args),
+        || SharedPitCoordinator::open(client, index, &args.pit_keep_alive, num_slices),
+    )
+    .await?;
 
     // Drop the sender to signal no more processing will happen after worker clones are done.
     drop(processed_tx);
@@ -354,4 +374,37 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_output_target_and_shared_pit;
+    use anyhow::anyhow;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn create_output_target_and_shared_pit_skips_pit_when_output_fails() {
+        let pit_opened = Arc::new(AtomicBool::new(false));
+
+        let error = create_output_target_and_shared_pit(
+            &crate::cli::SearchType::PointInTime,
+            || async { Err::<(), anyhow::Error>(anyhow!("output target failed")) },
+            {
+                let pit_opened = Arc::clone(&pit_opened);
+                move || async move {
+                    pit_opened.store(true, Ordering::Relaxed);
+                    Ok::<_, anyhow::Error>("pit-opened")
+                }
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("output target failed"));
+        assert!(!pit_opened.load(Ordering::Relaxed));
+    }
 }
