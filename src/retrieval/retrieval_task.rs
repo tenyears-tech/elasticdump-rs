@@ -13,23 +13,8 @@ use super::{
 };
 use crate::cli::SearchType;
 
-pub(crate) fn latest_scroll_id(response: &Value) -> Option<String> {
-    response.get("_scroll_id").as_str().map(|id| id.to_string())
-}
-
 pub(crate) fn latest_pit_id(response: &Value) -> Option<String> {
     response.get("pit_id").as_str().map(|id| id.to_string())
-}
-
-pub(crate) fn refresh_search_id(search_type: &SearchType, response: &Value, id: &mut String) {
-    let latest_id = match search_type {
-        SearchType::Scroll => latest_scroll_id(response),
-        SearchType::PointInTime => latest_pit_id(response),
-    };
-
-    if let Some(new_id) = latest_id {
-        *id = new_id;
-    }
 }
 
 pub(crate) async fn read_checked_response_bytes(
@@ -263,21 +248,6 @@ mod tests {
         assert_eq!(
             super::latest_pit_id(&response).as_deref(),
             Some("pit-from-search")
-        );
-    }
-
-    #[test]
-    fn latest_scroll_id_reads_continuation_response_id() {
-        let response = json!({
-            "_scroll_id": "scroll-from-response",
-            "hits": {
-                "hits": []
-            }
-        });
-
-        assert_eq!(
-            super::latest_scroll_id(&response).as_deref(),
-            Some("scroll-from-response")
         );
     }
 
