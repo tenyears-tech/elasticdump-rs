@@ -1249,6 +1249,48 @@ async fn test_basic_pit() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_basic_pit_still_dumps_all_documents_with_streaming_extractor() -> Result<()> {
+    let test_index = get_unique_test_index();
+    let output_file = format!("test_pit_streaming_output_{}.jsonl", test_index);
+
+    setup_test_data(&test_index).await?;
+
+    run_elasticdump_command(&[
+        "--input",
+        &format!("{}/{}", ES_URL, test_index),
+        "--output",
+        &output_file,
+        "--searchType",
+        "pit",
+        "--pitKeepAlive",
+        "1m",
+        "--limit",
+        "10",
+        "--quiet",
+    ])?;
+
+    let file = File::open(&output_file)?;
+    let reader = BufReader::new(file);
+    let mut line_count = 0;
+    let mut saw_source = false;
+
+    for line in reader.lines() {
+        let line = line?;
+        let parsed: Value = serde_json::from_str(&line)?;
+        if parsed["_source"]["name"].as_str().is_some() {
+            saw_source = true;
+        }
+        line_count += 1;
+    }
+
+    assert_eq!(line_count, 100, "Expected 100 documents in the output file");
+    assert!(saw_source);
+
+    cleanup(&test_index, &output_file).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_pit_with_query() -> Result<()> {
     // Get a unique test index and output file
     let test_index = get_unique_test_index();

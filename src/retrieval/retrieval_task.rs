@@ -4,7 +4,9 @@ use bytesize::ByteSize;
 use elasticsearch::{ClearScrollParts, Elasticsearch, http::response::Response};
 use http::StatusCode;
 use log::warn;
-use sonic_rs::{JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value, json};
+use sonic_rs::{JsonValueMutTrait, Value, json};
+#[cfg(test)]
+use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 use std::sync::atomic::Ordering;
 
 use super::{
@@ -13,6 +15,7 @@ use super::{
 };
 use crate::cli::SearchType;
 
+#[cfg(test)]
 pub(crate) fn latest_pit_id(response: &Value) -> Option<String> {
     response.get("pit_id").as_str().map(|id| id.to_string())
 }
@@ -79,6 +82,7 @@ pub(crate) struct TotalHitsEstimate {
     pub(crate) is_exact: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn extract_total_hits_estimate(response: &Value) -> TotalHitsEstimate {
     let value = response["hits"]["total"]["value"]
         .as_u64()

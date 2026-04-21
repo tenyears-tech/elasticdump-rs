@@ -1,14 +1,17 @@
 use anyhow::{Result, anyhow};
 use elasticsearch::SearchParts;
 use log::{debug, info};
-use sonic_rs::{JsonContainerTrait, JsonValueMutTrait, Value, json};
+use sonic_rs::{JsonValueMutTrait, Value, json};
+
+use crate::cli::SearchType;
 
 use super::{
     context::RetrievalContext,
+    extract::{self, BatchMetadata},
     pit::SharedPitCoordinator,
     retrieval_task::{
         TotalHitsEstimate, abort_shared_pit, dispatch_response_batch, ensure_pit_sort,
-        extract_total_hits_estimate, latest_pit_id, read_checked_response_bytes, record_total_hits,
+        read_checked_response_bytes, record_total_hits,
     },
     slice_state::SliceState,
 };
@@ -17,8 +20,8 @@ pub(crate) fn build_pit_search_body(
     base_body: &Value,
     pit_id: &str,
     pit_keep_alive: &str,
-    search_after: Option<&Value>,
-) -> Value {
+    search_after: Option<&[u8]>,
+) -> Result<Value> {
     let mut body = base_body.clone();
     let object = body.as_object_mut().expect("PIT body must be an object");
     object.insert(
@@ -26,9 +29,15 @@ pub(crate) fn build_pit_search_body(
         json!({ "id": pit_id, "keep_alive": pit_keep_alive }),
     );
     if let Some(search_after) = search_after {
-        object.insert(&"search_after", search_after.clone());
+        let search_after_value: Value = sonic_rs::from_slice(search_after)?;
+        object.insert(&"search_after", search_after_value);
     }
-    body
+    Ok(body)
+}
+
+pub(crate) fn apply_pit_batch_metadata(state: &mut SliceState, metadata: &BatchMetadata) {
+    state.current_id = metadata.next_pit_id.clone();
+    state.update_search_after_from_raw(metadata.last_sort_raw.as_deref());
 }
 
 pub(crate) async fn run_pit_slice(
@@ -43,7 +52,7 @@ pub(crate) async fn run_pit_slice(
     let lease = shared_pit.acquire().await;
     state.pit_generation = Some(lease.generation);
 
-    let initial_body = build_pit_search_body(&state.search_body, &lease.id, pit_keep_alive, None);
+    let initial_body = build_pit_search_body(&state.search_body, &lease.id, pit_keep_alive, None)?;
     debug!(
         "Search body: {}",
         sonic_rs::to_string(&initial_body).unwrap_or_default()
@@ -88,36 +97,22 @@ pub(crate) async fn run_pit_slice(
         state.slice_id, initial_bytes
     );
 
-    let search_response: Value = match sonic_rs::from_slice(&response_bytes) {
-        Ok(json) => {
-            debug!(
-                "Slice {}: Successfully parsed initial response from bytes",
-                state.slice_id
-            );
-            json
-        }
+    let metadata = match extract::extract_batch_metadata(&response_bytes, &SearchType::PointInTime)
+    {
+        Ok(metadata) => metadata,
         Err(error) => {
-            let parse_error = anyhow!(
-                "Slice {}: Failed to parse initial response from bytes: {} - this might indicate malformed JSON or unexpected response format",
-                state.slice_id,
-                error
-            );
-            abort_shared_pit(&Some(shared_pit.clone()), &parse_error).await;
-            return Err(parse_error);
+            abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+            return Err(error);
         }
     };
 
-    let slice_total_hits = record_total_hits(ctx, extract_total_hits_estimate(&search_response));
+    let slice_total_hits = record_total_hits(ctx, metadata.total_hits);
     debug!(
         "Slice {}: Total hits estimate: {} (exact: {})",
         state.slice_id, slice_total_hits.value, slice_total_hits.is_exact
     );
 
-    let hits = search_response["hits"]["hits"].as_array();
-    let doc_count = hits.map_or(0, |items| items.len() as u64);
-    let hits_are_empty = hits.is_none_or(|items| items.is_empty());
-    state.current_id = latest_pit_id(&search_response);
-    state.update_search_after_from_hits(hits.map(|items| &items[..]));
+    apply_pit_batch_metadata(state, &metadata);
     shared_pit
         .observe_returned_id(state.current_id.as_deref())
         .await;
@@ -126,8 +121,8 @@ pub(crate) async fn run_pit_slice(
         ctx,
         state,
         response_bytes,
-        doc_count,
-        hits_are_empty,
+        metadata.doc_count,
+        metadata.hits_are_empty,
         initial_bytes,
     )
     .await
@@ -177,12 +172,18 @@ pub(crate) async fn run_pit_slice(
 
     loop {
         debug!("Slice {}: Fetching next batch", state.slice_id);
-        let next_body = build_pit_search_body(
+        let next_body = match build_pit_search_body(
             &state.search_body,
             &current_request_id,
             pit_keep_alive,
-            state.search_after.as_ref(),
-        );
+            state.search_after.as_deref(),
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+                return Err(error);
+            }
+        };
         debug!(
             "Next PIT body: {}",
             sonic_rs::to_string(&next_body).unwrap_or_default()
@@ -227,30 +228,21 @@ pub(crate) async fn run_pit_slice(
             state.slice_id, batch_bytes
         );
 
-        let next_json: Value = match sonic_rs::from_slice(&next_response_bytes) {
-            Ok(json) => json,
-            Err(error) => {
-                let parse_error = anyhow!(
-                    "Slice {}: Failed to parse continuation response from bytes: {}",
-                    state.slice_id,
-                    error
-                );
-                abort_shared_pit(&Some(shared_pit.clone()), &parse_error).await;
-                return Err(parse_error);
-            }
-        };
+        let metadata =
+            match extract::extract_batch_metadata(&next_response_bytes, &SearchType::PointInTime) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+                    return Err(error);
+                }
+            };
 
         debug!(
-            "Slice {}: Next response JSON: {}",
-            state.slice_id,
-            sonic_rs::to_string(&next_json).unwrap_or_default()
+            "Slice {}: Continuation metadata: pit_id={:?}, doc_count={}, hits_are_empty={}",
+            state.slice_id, metadata.next_pit_id, metadata.doc_count, metadata.hits_are_empty
         );
 
-        state.current_id = latest_pit_id(&next_json);
-        let hits = next_json["hits"]["hits"].as_array();
-        let doc_count = hits.map_or(0, |items| items.len() as u64);
-        let hits_are_empty = hits.is_none_or(|items| items.is_empty());
-        state.update_search_after_from_hits(hits.map(|items| &items[..]));
+        apply_pit_batch_metadata(state, &metadata);
         shared_pit
             .observe_returned_id(state.current_id.as_deref())
             .await;
@@ -259,8 +251,8 @@ pub(crate) async fn run_pit_slice(
             ctx,
             state,
             next_response_bytes,
-            doc_count,
-            hits_are_empty,
+            metadata.doc_count,
+            metadata.hits_are_empty,
             batch_bytes,
         )
         .await
@@ -315,7 +307,10 @@ pub(crate) async fn run_pit_slice(
 
 #[cfg(test)]
 mod tests {
-    use super::build_pit_search_body;
+    use super::{apply_pit_batch_metadata, build_pit_search_body};
+    use crate::retrieval::extract::BatchMetadata;
+    use crate::retrieval::retrieval_task::TotalHitsEstimate;
+    use crate::retrieval::slice_state::SliceState;
     use sonic_rs::json;
 
     #[test]
@@ -328,8 +323,9 @@ mod tests {
             }),
             "pit-123",
             "1m",
-            Some(&json!(["_shard_doc", 77])),
-        );
+            Some(br#"["_shard_doc",77]"#),
+        )
+        .unwrap();
 
         assert_eq!(
             body,
@@ -340,6 +336,59 @@ mod tests {
                 "pit": { "id": "pit-123", "keep_alive": "1m" },
                 "search_after": ["_shard_doc", 77]
             })
+        );
+    }
+
+    #[test]
+    fn build_pit_search_body_embeds_raw_search_after_json() {
+        let body = build_pit_search_body(
+            &json!({
+                "query": { "match_all": {} },
+                "sort": ["_shard_doc"],
+                "size": 100
+            }),
+            "pit-123",
+            "1m",
+            Some(br#"[2,{"nested":true}]"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body,
+            json!({
+                "query": { "match_all": {} },
+                "sort": ["_shard_doc"],
+                "size": 100,
+                "pit": { "id": "pit-123", "keep_alive": "1m" },
+                "search_after": [2, {"nested": true}]
+            })
+        );
+    }
+
+    #[test]
+    fn apply_pit_batch_metadata_updates_state_from_raw_metadata() {
+        let mut state = SliceState::new(0, 0, json!({"size": 10}));
+        state.current_id = Some("pit-old".to_string());
+        state.update_search_after_from_raw(Some(br#"[1,"a"]"#));
+
+        let metadata = BatchMetadata {
+            total_hits: TotalHitsEstimate {
+                value: 2,
+                is_exact: true,
+            },
+            next_scroll_id: None,
+            next_pit_id: Some("pit-new".to_string()),
+            last_sort_raw: Some(br#"[2,{"nested":true}]"#.to_vec()),
+            doc_count: 2,
+            hits_are_empty: false,
+        };
+
+        apply_pit_batch_metadata(&mut state, &metadata);
+
+        assert_eq!(state.current_id.as_deref(), Some("pit-new"));
+        assert_eq!(
+            state.search_after.as_deref(),
+            Some(br#"[2,{"nested":true}]"#.as_slice())
         );
     }
 }
