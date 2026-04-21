@@ -35,6 +35,31 @@ pub(crate) fn build_pit_search_body(
     Ok(body)
 }
 
+pub(crate) fn update_pit_search_body(
+    body: &mut Value,
+    pit_id: &str,
+    pit_keep_alive: &str,
+    search_after: Option<&[u8]>,
+) -> Result<()> {
+    let object = body.as_object_mut().expect("PIT body must be an object");
+    object.insert(
+        &"pit",
+        json!({ "id": pit_id, "keep_alive": pit_keep_alive }),
+    );
+
+    match search_after {
+        Some(search_after) => {
+            let search_after_value: Value = sonic_rs::from_slice(search_after)?;
+            object.insert(&"search_after", search_after_value);
+        }
+        None => {
+            object.remove(&"search_after");
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn apply_pit_batch_metadata(state: &mut SliceState, metadata: &BatchMetadata) {
     state.current_id = metadata.next_pit_id.clone();
     state.update_search_after_from_raw(metadata.last_sort_raw.as_deref());
@@ -52,16 +77,17 @@ pub(crate) async fn run_pit_slice(
     let lease = shared_pit.acquire().await;
     state.pit_generation = Some(lease.generation);
 
-    let initial_body = build_pit_search_body(&state.search_body, &lease.id, pit_keep_alive, None)?;
+    let mut request_body =
+        build_pit_search_body(&state.search_body, &lease.id, pit_keep_alive, None)?;
     debug!(
         "Search body: {}",
-        sonic_rs::to_string(&initial_body).unwrap_or_default()
+        sonic_rs::to_string(&request_body).unwrap_or_default()
     );
 
     let response = match ctx
         .client
         .search(SearchParts::None)
-        .body(&initial_body)
+        .body(&request_body)
         .send()
         .await
     {
@@ -172,27 +198,24 @@ pub(crate) async fn run_pit_slice(
 
     loop {
         debug!("Slice {}: Fetching next batch", state.slice_id);
-        let next_body = match build_pit_search_body(
-            &state.search_body,
+        if let Err(error) = update_pit_search_body(
+            &mut request_body,
             &current_request_id,
             pit_keep_alive,
             state.search_after.as_deref(),
         ) {
-            Ok(body) => body,
-            Err(error) => {
-                abort_shared_pit(&Some(shared_pit.clone()), &error).await;
-                return Err(error);
-            }
-        };
+            abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+            return Err(error);
+        }
         debug!(
             "Next PIT body: {}",
-            sonic_rs::to_string(&next_body).unwrap_or_default()
+            sonic_rs::to_string(&request_body).unwrap_or_default()
         );
 
         let next_response = match ctx
             .client
             .search(SearchParts::None)
-            .body(&next_body)
+            .body(&request_body)
             .send()
             .await
         {
@@ -307,7 +330,7 @@ pub(crate) async fn run_pit_slice(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_pit_batch_metadata, build_pit_search_body};
+    use super::{apply_pit_batch_metadata, build_pit_search_body, update_pit_search_body};
     use crate::retrieval::extract::BatchMetadata;
     use crate::retrieval::retrieval_task::TotalHitsEstimate;
     use crate::retrieval::slice_state::SliceState;
@@ -361,6 +384,62 @@ mod tests {
                 "size": 100,
                 "pit": { "id": "pit-123", "keep_alive": "1m" },
                 "search_after": [2, {"nested": true}]
+            })
+        );
+    }
+
+    #[test]
+    fn update_pit_search_body_replaces_search_after_without_rebuilding_query_fields() {
+        let mut body = build_pit_search_body(
+            &json!({
+                "query": { "match_all": {} },
+                "sort": ["_shard_doc"],
+                "size": 100
+            }),
+            "pit-123",
+            "1m",
+            None,
+        )
+        .unwrap();
+
+        update_pit_search_body(&mut body, "pit-456", "2m", Some(br#"[7,{"nested":true}]"#))
+            .unwrap();
+
+        assert_eq!(
+            body,
+            json!({
+                "query": { "match_all": {} },
+                "sort": ["_shard_doc"],
+                "size": 100,
+                "pit": { "id": "pit-456", "keep_alive": "2m" },
+                "search_after": [7, {"nested": true}]
+            })
+        );
+    }
+
+    #[test]
+    fn update_pit_search_body_clears_stale_search_after() {
+        let mut body = build_pit_search_body(
+            &json!({
+                "query": { "match_all": {} },
+                "sort": ["_shard_doc"],
+                "size": 100
+            }),
+            "pit-123",
+            "1m",
+            Some(br#"["_shard_doc",77]"#),
+        )
+        .unwrap();
+
+        update_pit_search_body(&mut body, "pit-789", "1m", None).unwrap();
+
+        assert_eq!(
+            body,
+            json!({
+                "query": { "match_all": {} },
+                "sort": ["_shard_doc"],
+                "size": 100,
+                "pit": { "id": "pit-789", "keep_alive": "1m" }
             })
         );
     }
