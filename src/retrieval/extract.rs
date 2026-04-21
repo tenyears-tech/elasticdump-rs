@@ -77,11 +77,13 @@ pub(crate) fn extract_batch_metadata(
         let hit = hit?;
         doc_count += 1;
         if matches!(search_type, SearchType::PointInTime) {
-            last_sort_raw = hit.get("sort").and_then(|value| {
-                value
-                    .is_array()
-                    .then(|| value.as_raw_str().as_bytes().to_vec())
-            });
+            last_sort_raw = hit
+                .get("sort")
+                .and_then(|value| {
+                    value
+                        .is_array()
+                        .then(|| value.as_raw_str().as_bytes().to_vec())
+                });
         }
     }
 
@@ -121,12 +123,8 @@ pub(crate) fn extract_batch_metadata(
 }
 
 pub(crate) fn build_output_batch(response_bytes: &Bytes) -> Result<ExtractedOutputBatch> {
-    let hits = sonic_rs::get(response_bytes, &["hits", "hits"]).map_err(|error| {
-        anyhow!(
-            "Failed to locate hits.hits for output extraction: {}",
-            error
-        )
-    })?;
+    let hits = sonic_rs::get(response_bytes, &["hits", "hits"])
+        .map_err(|error| anyhow!("Failed to locate hits.hits for output extraction: {}", error))?;
     let iter = hits
         .into_array_iter()
         .ok_or_else(|| anyhow!("Elasticsearch response field hits.hits is not iterable"))?;
