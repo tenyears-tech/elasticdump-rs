@@ -22,6 +22,9 @@ BENCH_CODEC="${BENCH_CODEC:-default}"
 BENCH_FORCE_MERGE="${BENCH_FORCE_MERGE:-1}"
 BENCH_MAX_NUM_SEGMENTS="${BENCH_MAX_NUM_SEGMENTS:-1}"
 BENCH_USE_EXPLICIT_IDS="${BENCH_USE_EXPLICIT_IDS:-1}"
+BENCH_SEARCH_TYPES="${BENCH_SEARCH_TYPES:-scroll,pit}"
+BENCH_SCROLL_TIME="${BENCH_SCROLL_TIME:-10m}"
+BENCH_PIT_KEEP_ALIVE="${BENCH_PIT_KEEP_ALIVE:-10m}"
 BENCH_INDEX_PREFIX="${BENCH_INDEX_PREFIX:-elasticdump_rs_bench}"
 BENCH_INDEX_NAME="${BENCH_INDEX_NAME:-}"
 BENCH_WORKDIR="${BENCH_WORKDIR:-}"
@@ -38,6 +41,8 @@ BENCH_INDEX=""
 PYTHON_BIN=""
 RS_BIN=""
 declare -a ELASTICDUMP_CMD=()
+declare -a BENCH_SEARCH_TYPE_LIST=()
+declare -a BENCH_VARIANTS=()
 
 log() {
   printf '[bench] %s\n' "$*"
@@ -66,6 +71,9 @@ Options:
   --force-merge 0|1           Force-merge the read-only index before timed runs
   --max-num-segments N        max_num_segments for force-merge
   --explicit-ids 0|1          Seed deterministic document IDs
+  --search-types TYPES        Comma-separated search types: scroll,pit
+  --scroll-time TIME          Scroll keepalive passed to scroll variants
+  --pit-keep-alive TIME       PIT keepalive passed to PIT variants
   --index-name NAME           Explicit benchmark index name
   --index-prefix PREFIX       Prefix for generated benchmark index names
   --workdir DIR               Artifact work directory
@@ -138,6 +146,21 @@ parse_args() {
       --explicit-ids)
         require_option_value "$@"
         BENCH_USE_EXPLICIT_IDS="$2"
+        shift 2
+        ;;
+      --search-types)
+        require_option_value "$@"
+        BENCH_SEARCH_TYPES="$2"
+        shift 2
+        ;;
+      --scroll-time)
+        require_option_value "$@"
+        BENCH_SCROLL_TIME="$2"
+        shift 2
+        ;;
+      --pit-keep-alive)
+        require_option_value "$@"
+        BENCH_PIT_KEEP_ALIVE="$2"
         shift 2
         ;;
       --index-name)
@@ -224,6 +247,24 @@ validate_uint() {
   [[ ! "$value" =~ ^0[0-9]+$ ]] || die "${name} must not use leading-zero notation, got: ${value}"
 }
 
+split_search_types() {
+  local raw="$1"
+  local part
+
+  BENCH_SEARCH_TYPE_LIST=()
+  IFS=',' read -r -a BENCH_SEARCH_TYPE_LIST <<< "${raw}"
+
+  for part in "${BENCH_SEARCH_TYPE_LIST[@]}"; do
+    [[ -n "${part}" ]] || die "BENCH_SEARCH_TYPES must not contain empty entries"
+    case "${part}" in
+      scroll | pit) ;;
+      *)
+        die "BENCH_SEARCH_TYPES entries must be scroll or pit, got: ${part}"
+        ;;
+    esac
+  done
+}
+
 validate_index_name() {
   local value="$1"
 
@@ -275,6 +316,8 @@ validate_config() {
       die "BENCH_USE_EXPLICIT_IDS must be 0 or 1, got: ${BENCH_USE_EXPLICIT_IDS}"
       ;;
   esac
+
+  split_search_types "${BENCH_SEARCH_TYPES}"
 
   (( BENCH_BULK_SIZE > 0 )) || die "BENCH_BULK_SIZE must be greater than zero"
   (( BENCH_LIMIT > 0 )) || die "BENCH_LIMIT must be greater than zero"
@@ -784,6 +827,23 @@ log_run_metrics() {
   log "${phase} ${run_number}/${run_total} ${tool_name}: wall ${real_seconds}s | cpu ${cpu_seconds}s (user ${user_seconds}s + sys ${sys_seconds}s), ${line_count} lines, ${byte_count} bytes"
 }
 
+build_benchmark_variants() {
+  local search_type
+
+  BENCH_VARIANTS=()
+  for search_type in "${BENCH_SEARCH_TYPE_LIST[@]}"; do
+    BENCH_VARIANTS+=("elasticdump-rs:${search_type}")
+    BENCH_VARIANTS+=("elasticdump:${search_type}")
+  done
+}
+
+variant_label() {
+  local tool_name="$1"
+  local search_type="$2"
+
+  printf '%s-%s\n' "${tool_name}" "${search_type}"
+}
+
 run_one_series_entry() {
   local tool_name="$1"
   local phase="$2"
@@ -839,16 +899,19 @@ run_elasticdump_rs_entry() {
   local run_number="$2"
   local run_total="$3"
   local results_file="$4"
+  local search_type="$5"
   local output_file
   local metrics_file
   local input_url
+  local tool_label
 
   input_url="$(es_url "/${BENCH_INDEX}")"
-  output_file="${WORKDIR}/elasticdump-rs.${phase}.${run_number}.jsonl"
-  metrics_file="${WORKDIR}/elasticdump-rs.${phase}.${run_number}.metrics"
+  tool_label="$(variant_label "elasticdump-rs" "${search_type}")"
+  output_file="${WORKDIR}/${tool_label}.${phase}.${run_number}.jsonl"
+  metrics_file="${WORKDIR}/${tool_label}.${phase}.${run_number}.metrics"
 
   run_one_series_entry \
-    "elasticdump-rs" \
+    "${tool_label}" \
     "${phase}" \
     "${run_number}" \
     "${run_total}" \
@@ -860,10 +923,13 @@ run_elasticdump_rs_entry() {
     --output "${output_file}" \
     --type data \
     --limit "${BENCH_LIMIT}" \
-    --scrollTime 10m \
-    --searchType scroll \
     --overwrite \
-    --quiet
+    --quiet \
+    $(if [[ "${search_type}" == "scroll" ]]; then
+        printf '%s\n' "--scrollTime" "${BENCH_SCROLL_TIME}" "--searchType" "scroll"
+      else
+        printf '%s\n' "--searchType" "pit" "--pitKeepAlive" "${BENCH_PIT_KEEP_ALIVE}"
+      fi)
 }
 
 run_elasticdump_entry() {
@@ -871,16 +937,19 @@ run_elasticdump_entry() {
   local run_number="$2"
   local run_total="$3"
   local results_file="$4"
+  local search_type="$5"
   local output_file
   local metrics_file
   local input_url
+  local tool_label
 
   input_url="$(es_url "/${BENCH_INDEX}")"
-  output_file="${WORKDIR}/elasticdump.${phase}.${run_number}.jsonl"
-  metrics_file="${WORKDIR}/elasticdump.${phase}.${run_number}.metrics"
+  tool_label="$(variant_label "elasticdump" "${search_type}")"
+  output_file="${WORKDIR}/${tool_label}.${phase}.${run_number}.jsonl"
+  metrics_file="${WORKDIR}/${tool_label}.${phase}.${run_number}.metrics"
 
   run_one_series_entry \
-    "elasticdump" \
+    "${tool_label}" \
     "${phase}" \
     "${run_number}" \
     "${run_total}" \
@@ -891,10 +960,14 @@ run_elasticdump_entry() {
     --input "${input_url}" \
     --output "${output_file}" \
     --limit "${BENCH_LIMIT}" \
-    --scrollTime 10m \
     --quiet \
     --overwrite \
-    --type=data
+    --type=data \
+    $(if [[ "${search_type}" == "scroll" ]]; then
+        printf '%s\n' "--scrollTime" "${BENCH_SCROLL_TIME}"
+      else
+        printf '%s\n' "--pit" "--pitKeepAlive" "${BENCH_PIT_KEEP_ALIVE}"
+      fi)
 }
 
 run_benchmark_round() {
@@ -903,14 +976,24 @@ run_benchmark_round() {
   local run_total="$3"
   local results_file="$4"
   local round_index="$5"
+  local variant_count="${#BENCH_VARIANTS[@]}"
+  local offset
+  local variant_index
+  local variant
+  local tool_name
+  local search_type
 
-  if (( round_index % 2 == 1 )); then
-    run_elasticdump_rs_entry "${phase}" "${run_number}" "${run_total}" "${results_file}"
-    run_elasticdump_entry "${phase}" "${run_number}" "${run_total}" "${results_file}"
-  else
-    run_elasticdump_entry "${phase}" "${run_number}" "${run_total}" "${results_file}"
-    run_elasticdump_rs_entry "${phase}" "${run_number}" "${run_total}" "${results_file}"
-  fi
+  for (( offset = 0; offset < variant_count; offset++ )); do
+    variant_index=$(( (round_index - 1 + offset) % variant_count ))
+    variant="${BENCH_VARIANTS[variant_index]}"
+    IFS=':' read -r tool_name search_type <<< "${variant}"
+
+    if [[ "${tool_name}" == "elasticdump-rs" ]]; then
+      run_elasticdump_rs_entry "${phase}" "${run_number}" "${run_total}" "${results_file}" "${search_type}"
+    else
+      run_elasticdump_entry "${phase}" "${run_number}" "${run_total}" "${results_file}" "${search_type}"
+    fi
+  done
 }
 
 run_benchmark_series() {
@@ -938,8 +1021,8 @@ import sys
 
 results_file = sys.argv[1]
 expected_runs = int(sys.argv[2])
-tools = ("elasticdump-rs", "elasticdump")
-rows_by_tool = {tool: [] for tool in tools}
+tools = []
+rows_by_tool = {}
 
 with open(results_file, "r", encoding="utf-8", newline="") as handle:
     reader = csv.DictReader(handle, delimiter="\t")
@@ -961,7 +1044,8 @@ with open(results_file, "r", encoding="utf-8", newline="") as handle:
     for row in reader:
         tool = row["tool"]
         if tool not in rows_by_tool:
-            raise SystemExit(f"Unexpected tool in results: {tool}")
+            rows_by_tool[tool] = []
+            tools.append(tool)
         rows_by_tool[tool].append(
             {
                 "run": int(row["run"]),
@@ -979,9 +1063,6 @@ for tool, rows in rows_by_tool.items():
         raise SystemExit(
             f"Measured run count mismatch for {tool}: expected {expected_runs}, got {len(rows)}"
         )
-
-if len(rows_by_tool["elasticdump-rs"]) != len(rows_by_tool["elasticdump"]):
-    raise SystemExit("Measured run counts differ between elasticdump-rs and elasticdump")
 
 print("Measured runs (warmups excluded)")
 for tool in tools:
@@ -1027,83 +1108,80 @@ for tool in tools:
         f"{avg['lines']} lines avg, {avg['bytes']} bytes avg"
     )
 
-rs_avg = averages["elasticdump-rs"]["real_seconds"]
-node_avg = averages["elasticdump"]["real_seconds"]
+def print_comparison(label, lhs, rhs):
+    if lhs not in averages or rhs not in averages:
+        return
 
-rs_avg_text = display_seconds_text(rs_avg)
-node_avg_text = display_seconds_text(node_avg)
-rs_cpu_avg_text = averages["elasticdump-rs"]["display_cpu_seconds"]
-node_cpu_avg_text = averages["elasticdump"]["display_cpu_seconds"]
+    lhs_real = averages[lhs]["real_seconds"]
+    rhs_real = averages[rhs]["real_seconds"]
+    lhs_cpu = averages[lhs]["cpu_seconds"]
+    rhs_cpu = averages[rhs]["cpu_seconds"]
 
-rs_avg_display = display_seconds_value(rs_avg)
-node_avg_display = display_seconds_value(node_avg)
-rs_cpu_avg_display = display_seconds_value(averages["elasticdump-rs"]["cpu_seconds"])
-node_cpu_avg_display = display_seconds_value(averages["elasticdump"]["cpu_seconds"])
+    lhs_real_text = display_seconds_text(lhs_real)
+    rhs_real_text = display_seconds_text(rhs_real)
+    lhs_cpu_text = display_seconds_text(lhs_cpu)
+    rhs_cpu_text = display_seconds_text(rhs_cpu)
 
-if rs_avg_display == node_avg_display:
-    wall_summary = (
-        "Wall-clock: elasticdump-rs and elasticdump tied "
-        f"at {rs_avg_text}s average wall-clock time"
-    )
-elif rs_avg_display == 0:
-    wall_summary = (
-        "Wall-clock: elasticdump-rs completed faster than elasticdump "
-        f"({rs_avg_text}s avg vs {node_avg_text}s avg)"
-    )
-elif node_avg_display == 0:
-    wall_summary = (
-        "Wall-clock: elasticdump completed faster than elasticdump-rs "
-        f"({node_avg_text}s avg vs {rs_avg_text}s avg)"
-    )
-elif rs_avg < node_avg:
-    speedup = node_avg / rs_avg
-    wall_summary = (
-        "Wall-clock: elasticdump-rs was "
-        f"{speedup:.2f}x faster than elasticdump "
-        f"({rs_avg_text}s avg vs {node_avg_text}s avg)"
-    )
-else:
-    speedup = rs_avg / node_avg
-    wall_summary = (
-        "Wall-clock: elasticdump was "
-        f"{speedup:.2f}x faster than elasticdump-rs "
-        f"({node_avg_text}s avg vs {rs_avg_text}s avg)"
-    )
+    lhs_real_display = display_seconds_value(lhs_real)
+    rhs_real_display = display_seconds_value(rhs_real)
+    lhs_cpu_display = display_seconds_value(lhs_cpu)
+    rhs_cpu_display = display_seconds_value(rhs_cpu)
 
-if rs_cpu_avg_display == node_cpu_avg_display:
-    cpu_summary = (
-        "CPU total: elasticdump-rs and elasticdump tied "
-        f"at {rs_cpu_avg_text}s average CPU time"
-    )
-elif rs_cpu_avg_display == 0:
-    cpu_summary = (
-        "CPU total: elasticdump-rs used "
-        f"{0.0:.2f}x the CPU time of elasticdump "
-        f"({rs_cpu_avg_text}s avg vs {node_cpu_avg_text}s avg)"
-    )
-elif node_cpu_avg_display == 0:
-    cpu_summary = (
-        "CPU total: elasticdump used "
-        f"{0.0:.2f}x the CPU time of elasticdump-rs "
-        f"({node_cpu_avg_text}s avg vs {rs_cpu_avg_text}s avg)"
-    )
-elif rs_cpu_avg_display > node_cpu_avg_display:
-    cpu_ratio = rs_cpu_avg_display / node_cpu_avg_display
-    cpu_summary = (
-        "CPU total: elasticdump-rs used "
-        f"{cpu_ratio:.2f}x the CPU time of elasticdump "
-        f"({rs_cpu_avg_text}s avg vs {node_cpu_avg_text}s avg)"
-    )
-else:
-    cpu_ratio = node_cpu_avg_display / rs_cpu_avg_display
-    cpu_summary = (
-        "CPU total: elasticdump used "
-        f"{cpu_ratio:.2f}x the CPU time of elasticdump-rs "
-        f"({node_cpu_avg_text}s avg vs {rs_cpu_avg_text}s avg)"
-    )
+    if lhs_real_display == rhs_real_display:
+        wall_summary = (
+            f"{label} wall-clock: tied at {lhs_real_text}s avg"
+        )
+    elif lhs_real_display == 0:
+        wall_summary = (
+            f"{label} wall-clock: {lhs} completed faster "
+            f"({lhs_real_text}s avg vs {rhs_real_text}s avg)"
+        )
+    elif rhs_real_display == 0:
+        wall_summary = (
+            f"{label} wall-clock: {rhs} completed faster "
+            f"({rhs_real_text}s avg vs {lhs_real_text}s avg)"
+        )
+    elif lhs_real < rhs_real:
+        wall_summary = (
+            f"{label} wall-clock: {lhs} was {rhs_real / lhs_real:.2f}x faster "
+            f"({lhs_real_text}s avg vs {rhs_real_text}s avg)"
+        )
+    else:
+        wall_summary = (
+            f"{label} wall-clock: {rhs} was {lhs_real / rhs_real:.2f}x faster "
+            f"({rhs_real_text}s avg vs {lhs_real_text}s avg)"
+        )
 
-print(wall_summary)
-print(cpu_summary)
+    if lhs_cpu_display == rhs_cpu_display:
+        cpu_summary = f"{label} CPU total: tied at {lhs_cpu_text}s avg"
+    elif lhs_cpu_display == 0:
+        cpu_summary = (
+            f"{label} CPU total: {lhs} used {0.0:.2f}x the CPU time of {rhs} "
+            f"({lhs_cpu_text}s avg vs {rhs_cpu_text}s avg)"
+        )
+    elif rhs_cpu_display == 0:
+        cpu_summary = (
+            f"{label} CPU total: {rhs} used {0.0:.2f}x the CPU time of {lhs} "
+            f"({rhs_cpu_text}s avg vs {lhs_cpu_text}s avg)"
+        )
+    elif lhs_cpu_display > rhs_cpu_display:
+        cpu_summary = (
+            f"{label} CPU total: {lhs} used {lhs_cpu_display / rhs_cpu_display:.2f}x the CPU time of {rhs} "
+            f"({lhs_cpu_text}s avg vs {rhs_cpu_text}s avg)"
+        )
+    else:
+        cpu_summary = (
+            f"{label} CPU total: {rhs} used {rhs_cpu_display / lhs_cpu_display:.2f}x the CPU time of {lhs} "
+            f"({rhs_cpu_text}s avg vs {lhs_cpu_text}s avg)"
+        )
+
+    print(wall_summary)
+    print(cpu_summary)
+
+print_comparison("Scroll rs vs node", "elasticdump-rs-scroll", "elasticdump-scroll")
+print_comparison("PIT rs vs node", "elasticdump-rs-pit", "elasticdump-pit")
+print_comparison("elasticdump-rs PIT vs Scroll", "elasticdump-rs-pit", "elasticdump-rs-scroll")
+print_comparison("elasticdump PIT vs Scroll", "elasticdump-pit", "elasticdump-scroll")
 PY
 }
 
@@ -1174,6 +1252,9 @@ main() {
   printf '  BENCH_FORCE_MERGE=%s\n' "${BENCH_FORCE_MERGE}"
   printf '  BENCH_MAX_NUM_SEGMENTS=%s\n' "${BENCH_MAX_NUM_SEGMENTS}"
   printf '  BENCH_USE_EXPLICIT_IDS=%s\n' "${BENCH_USE_EXPLICIT_IDS}"
+  printf '  BENCH_SEARCH_TYPES=%s\n' "${BENCH_SEARCH_TYPES}"
+  printf '  BENCH_SCROLL_TIME=%s\n' "${BENCH_SCROLL_TIME}"
+  printf '  BENCH_PIT_KEEP_ALIVE=%s\n' "${BENCH_PIT_KEEP_ALIVE}"
   printf '  BENCH_INDEX=%s\n' "${BENCH_INDEX}"
   printf '  WORKDIR=%s\n' "${WORKDIR}"
 
@@ -1193,6 +1274,7 @@ main() {
 
   resolve_elasticdump_command
   resolve_rs_binary
+  build_benchmark_variants
   printf '  RS_BIN=%s\n' "${RS_BIN}"
   printf '  ELASTICDUMP_CMD=%s\n' "${ELASTICDUMP_CMD[*]}"
 
