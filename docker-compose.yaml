@@ -8,12 +8,16 @@ services:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
       - xpack.security.enabled=false
+      # Keep the benchmark heap close to the intended production-like local
+      # setup. Do not pair this with a tight container memory limit: Lucene's
+      # filesystem cache is accounted to the container cgroup too.
       - ES_JAVA_OPTS=-Xms4g -Xmx4g
     ulimits:
       memlock:
         soft: -1
         hard: -1
-    mem_limit: 5g
+    # No mem_limit here on purpose. A tight cgroup limit also constrains the
+    # filesystem cache used by Lucene during dump/search benchmarks.
     ports:
       - 9200:9200
     networks:

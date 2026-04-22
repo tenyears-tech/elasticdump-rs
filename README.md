@@ -126,50 +126,6 @@ This tool is inspired by the Node.js [elasticdump](https://github.com/elasticsea
 
 `elasticdump-rs` is optimized for high throughput and low memory usage, making it suitable for dumping large indices. The performance will vary based on your network, Elasticsearch cluster, and local machine capabilities.
 
-The canonical maintainer-run local comparison lives in `scripts/benchmark/compare-with-elasticdump.sh`. It is intended for apples-to-apples benchmarking against the original Node.js `elasticdump`, outside the normal Rust integration test harness.
-
-The benchmark script:
-
-- creates and seeds its own logging-style benchmark index
-- runs `elasticdump-rs` and the original `elasticdump` sequentially with the same practical settings
-- keeps `elasticdump-rs` on Scroll mode for direct comparability with `elasticdump`
-- treats the first pass for each tool as a warmup by default
-- validates output line counts before reporting a result
-- prints a human-readable per-run summary plus averages and headline comparisons for both wall-clock and CPU time
-
-Local prerequisites:
-
-- a reachable Elasticsearch node at `ES_URL` (default `http://localhost:9200`)
-- `elasticdump`
-- `/usr/bin/time`
-- `mktemp`
-- `python3`
-- `curl`
-- a built `elasticdump-rs` release binary or a buildable workspace
-
-Typical maintainer run:
-
-```bash
-scripts/benchmark/compare-with-elasticdump.sh
-```
-
-Warning: the default run keeps the seeded benchmark index and generated artifacts because `BENCH_KEEP_ARTIFACTS=1`. If you set `BENCH_INDEX_NAME`, the script will upfront delete/recreate that exact index name before seeding, so use a dedicated benchmark-only name.
-
-Useful environment overrides:
-
-```bash
-BENCH_DOCS=200000 \
-BENCH_BULK_SIZE=5000 \
-BENCH_LIMIT=10000 \
-BENCH_TEXT_BYTES=256 \
-BENCH_WARMUP_RUNS=1 \
-BENCH_MEASURED_RUNS=2 \
-BENCH_KEEP_ARTIFACTS=1 \
-scripts/benchmark/compare-with-elasticdump.sh
-```
-
-Warmup runs are excluded from the headline result. Only measured runs are recorded in the summary and used for the average wall-clock and CPU comparisons.
-
 ## Testing
 
 The project includes both unit tests and integration tests:

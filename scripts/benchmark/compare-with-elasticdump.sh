@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Maintainer-only benchmark for comparing elasticdump-rs with the original
+# Node.js elasticdump. The default Elasticsearch setup models this project's
+# production dump target: a static, read-optimized index that uses the default
+# Elasticsearch codec and is force-merged before timed export runs.
+#
+# Docker note: local benchmark quality depends on filesystem cache. If you use
+# this repo's docker-compose.yaml, recreate the Elasticsearch container after
+# compose memory changes so the heap/cache balance matches the benchmark intent.
+
 ES_URL="${ES_URL:-http://localhost:9200}"
 BENCH_DOCS="${BENCH_DOCS:-1000000}"
 BENCH_BULK_SIZE="${BENCH_BULK_SIZE:-5000}"
@@ -8,7 +17,11 @@ BENCH_LIMIT="${BENCH_LIMIT:-10000}"
 BENCH_TEXT_BYTES="${BENCH_TEXT_BYTES:-256}"
 BENCH_WARMUP_RUNS="${BENCH_WARMUP_RUNS:-1}"
 BENCH_MEASURED_RUNS="${BENCH_MEASURED_RUNS:-2}"
-BENCH_KEEP_ARTIFACTS="${BENCH_KEEP_ARTIFACTS:-1}"
+BENCH_KEEP_ARTIFACTS="${BENCH_KEEP_ARTIFACTS:-0}"
+BENCH_CODEC="${BENCH_CODEC:-default}"
+BENCH_FORCE_MERGE="${BENCH_FORCE_MERGE:-1}"
+BENCH_MAX_NUM_SEGMENTS="${BENCH_MAX_NUM_SEGMENTS:-1}"
+BENCH_USE_EXPLICIT_IDS="${BENCH_USE_EXPLICIT_IDS:-1}"
 BENCH_INDEX_PREFIX="${BENCH_INDEX_PREFIX:-elasticdump_rs_bench}"
 BENCH_INDEX_NAME="${BENCH_INDEX_NAME:-}"
 BENCH_WORKDIR="${BENCH_WORKDIR:-}"
@@ -48,6 +61,11 @@ Options:
   --warmup-runs N             Warmup runs per tool
   --measured-runs N           Measured runs per tool
   --keep-artifacts 0|1        Keep benchmark index and files after exit
+  --codec default|best_compression
+                              Benchmark index codec; default omits index.codec
+  --force-merge 0|1           Force-merge the read-only index before timed runs
+  --max-num-segments N        max_num_segments for force-merge
+  --explicit-ids 0|1          Seed deterministic document IDs
   --index-name NAME           Explicit benchmark index name
   --index-prefix PREFIX       Prefix for generated benchmark index names
   --workdir DIR               Artifact work directory
@@ -100,6 +118,26 @@ parse_args() {
       --keep-artifacts)
         require_option_value "$@"
         BENCH_KEEP_ARTIFACTS="$2"
+        shift 2
+        ;;
+      --codec)
+        require_option_value "$@"
+        BENCH_CODEC="$2"
+        shift 2
+        ;;
+      --force-merge)
+        require_option_value "$@"
+        BENCH_FORCE_MERGE="$2"
+        shift 2
+        ;;
+      --max-num-segments)
+        require_option_value "$@"
+        BENCH_MAX_NUM_SEGMENTS="$2"
+        shift 2
+        ;;
+      --explicit-ids)
+        require_option_value "$@"
+        BENCH_USE_EXPLICIT_IDS="$2"
         shift 2
         ;;
       --index-name)
@@ -208,6 +246,7 @@ validate_config() {
   validate_uint "BENCH_TEXT_BYTES" "${BENCH_TEXT_BYTES}"
   validate_uint "BENCH_WARMUP_RUNS" "${BENCH_WARMUP_RUNS}"
   validate_uint "BENCH_MEASURED_RUNS" "${BENCH_MEASURED_RUNS}"
+  validate_uint "BENCH_MAX_NUM_SEGMENTS" "${BENCH_MAX_NUM_SEGMENTS}"
 
   case "${BENCH_KEEP_ARTIFACTS}" in
     0 | 1) ;;
@@ -216,12 +255,83 @@ validate_config() {
       ;;
   esac
 
+  case "${BENCH_CODEC}" in
+    default | best_compression) ;;
+    *)
+      die "BENCH_CODEC must be default or best_compression, got: ${BENCH_CODEC}"
+      ;;
+  esac
+
+  case "${BENCH_FORCE_MERGE}" in
+    0 | 1) ;;
+    *)
+      die "BENCH_FORCE_MERGE must be 0 or 1, got: ${BENCH_FORCE_MERGE}"
+      ;;
+  esac
+
+  case "${BENCH_USE_EXPLICIT_IDS}" in
+    0 | 1) ;;
+    *)
+      die "BENCH_USE_EXPLICIT_IDS must be 0 or 1, got: ${BENCH_USE_EXPLICIT_IDS}"
+      ;;
+  esac
+
   (( BENCH_BULK_SIZE > 0 )) || die "BENCH_BULK_SIZE must be greater than zero"
   (( BENCH_LIMIT > 0 )) || die "BENCH_LIMIT must be greater than zero"
+  (( BENCH_MAX_NUM_SEGMENTS > 0 )) || die "BENCH_MAX_NUM_SEGMENTS must be greater than zero"
 }
 
 resolve_python() {
   PYTHON_BIN="$(resolve_command_path python3)"
+}
+
+create_index_body() {
+  "${PYTHON_BIN}" - "${BENCH_CODEC}" <<'PY'
+import json
+import sys
+
+codec = sys.argv[1]
+
+index_settings = {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "-1",
+}
+if codec != "default":
+    index_settings["codec"] = codec
+
+body = {
+    "settings": {
+        "index": index_settings,
+    },
+    "mappings": {
+        "dynamic": "strict",
+        "properties": {
+            "@timestamp": {"type": "date"},
+            "level": {"type": "keyword"},
+            "service": {"type": "keyword"},
+            "host": {"type": "keyword"},
+            "message": {"type": "text"},
+            "trace_id": {"type": "keyword"},
+            "span_id": {"type": "keyword"},
+            "request_id": {"type": "keyword"},
+            "env": {"type": "keyword"},
+            "region": {"type": "keyword"},
+            "metadata": {
+                "properties": {
+                    "attempt": {"type": "integer"},
+                    "bytes": {"type": "integer"},
+                    "status": {"type": "integer"},
+                    "success": {"type": "boolean"},
+                    "source": {"type": "keyword"},
+                }
+            },
+        },
+    },
+}
+
+print(json.dumps(body, separators=(",", ":")))
+PY
 }
 
 delete_index_if_exists() {
@@ -266,43 +376,8 @@ create_index() {
       --write-out '%{http_code}' \
       --request PUT \
       --header 'Content-Type: application/json' \
-      --data @- \
-      "$(es_url "/${BENCH_INDEX}")" <<'JSON'
-{
-  "settings": {
-    "index": {
-      "number_of_shards": 1,
-      "number_of_replicas": 0,
-      "refresh_interval": "-1",
-      "codec": "best_compression"
-    }
-  },
-  "mappings": {
-    "dynamic": "strict",
-    "properties": {
-      "@timestamp": { "type": "date" },
-      "level": { "type": "keyword" },
-      "service": { "type": "keyword" },
-      "host": { "type": "keyword" },
-      "message": { "type": "text" },
-      "trace_id": { "type": "keyword" },
-      "span_id": { "type": "keyword" },
-      "request_id": { "type": "keyword" },
-      "env": { "type": "keyword" },
-      "region": { "type": "keyword" },
-      "metadata": {
-        "properties": {
-          "attempt": { "type": "integer" },
-          "bytes": { "type": "integer" },
-          "status": { "type": "integer" },
-          "success": { "type": "boolean" },
-          "source": { "type": "keyword" }
-        }
-      }
-    }
-  }
-}
-JSON
+      --data-binary "$(create_index_body)" \
+      "$(es_url "/${BENCH_INDEX}")"
   )"
 
   case "${http_code}" in
@@ -322,7 +397,7 @@ generate_bulk_batch() {
   local batch_size="$2"
   local output_file="$3"
 
-  "${PYTHON_BIN}" - "${BENCH_INDEX}" "${start_doc}" "${batch_size}" "${BENCH_TEXT_BYTES}" "${output_file}" <<'PY'
+  "${PYTHON_BIN}" - "${BENCH_INDEX}" "${start_doc}" "${batch_size}" "${BENCH_TEXT_BYTES}" "${BENCH_USE_EXPLICIT_IDS}" "${output_file}" <<'PY'
 import json
 import sys
 
@@ -330,7 +405,8 @@ index_name = sys.argv[1]
 start_doc = int(sys.argv[2])
 batch_size = int(sys.argv[3])
 text_bytes = int(sys.argv[4])
-output_file = sys.argv[5]
+use_explicit_ids = sys.argv[5] == "1"
+output_file = sys.argv[6]
 
 LEVELS = ("INFO", "WARN", "ERROR", "DEBUG")
 SERVICES = ("api", "worker", "ingest", "search")
@@ -370,7 +446,10 @@ with open(output_file, "w", encoding="ascii", newline="\n") as handle:
                 "source": "benchmark-seed",
             },
         }
-        action = {"index": {"_index": index_name, "_id": f"doc-{doc_id:08d}"}}
+        index_action = {"_index": index_name}
+        if use_explicit_ids:
+            index_action["_id"] = f"doc-{doc_id:08d}"
+        action = {"index": index_action}
         handle.write(json.dumps(action, separators=(",", ":")))
         handle.write("\n")
         handle.write(json.dumps(source, separators=(",", ":")))
@@ -459,14 +538,24 @@ seed_index() {
   done
 }
 
-refresh_index() {
+prepare_index_for_reads() {
   local settings_response
+  local merge_response
   local refresh_response
   local settings_code
+  local merge_code
   local refresh_code
+  local settings_body
 
   settings_response="$(mktemp "${WORKDIR}/refresh-settings.XXXXXX.json")"
+  merge_response="$(mktemp "${WORKDIR}/force-merge.XXXXXX.json")"
   refresh_response="$(mktemp "${WORKDIR}/refresh-index.XXXXXX.json")"
+
+  if [[ "${BENCH_FORCE_MERGE}" == "1" ]]; then
+    settings_body='{"index.refresh_interval":"1s","index.blocks.write":true}'
+  else
+    settings_body='{"index.refresh_interval":"1s"}'
+  fi
 
   settings_code="$(
     curl --silent --show-error \
@@ -474,14 +563,30 @@ refresh_index() {
       --write-out '%{http_code}' \
       --request PUT \
       --header 'Content-Type: application/json' \
-      --data '{"index":{"refresh_interval":"1s"}}' \
+      --data "${settings_body}" \
       "$(es_url "/${BENCH_INDEX}/_settings")"
   )"
 
   if [[ "${settings_code}" != "200" ]]; then
     cat -- "${settings_response}" >&2
-    rm -f -- "${settings_response}" "${refresh_response}"
-    die "Failed to restore refresh interval on ${BENCH_INDEX} (HTTP ${settings_code})"
+    rm -f -- "${settings_response}" "${merge_response}" "${refresh_response}"
+    die "Failed to prepare read settings on ${BENCH_INDEX} (HTTP ${settings_code})"
+  fi
+
+  if [[ "${BENCH_FORCE_MERGE}" == "1" ]]; then
+    merge_code="$(
+      curl --silent --show-error \
+        --output "${merge_response}" \
+        --write-out '%{http_code}' \
+        --request POST \
+        "$(es_url "/${BENCH_INDEX}/_forcemerge?max_num_segments=${BENCH_MAX_NUM_SEGMENTS}")"
+    )"
+
+    if [[ "${merge_code}" != "200" ]]; then
+      cat -- "${merge_response}" >&2
+      rm -f -- "${settings_response}" "${merge_response}" "${refresh_response}"
+      die "Failed to force-merge benchmark index ${BENCH_INDEX} (HTTP ${merge_code})"
+    fi
   fi
 
   refresh_code="$(
@@ -494,11 +599,11 @@ refresh_index() {
 
   if [[ "${refresh_code}" != "200" ]]; then
     cat -- "${refresh_response}" >&2
-    rm -f -- "${settings_response}" "${refresh_response}"
+    rm -f -- "${settings_response}" "${merge_response}" "${refresh_response}"
     die "Failed to refresh benchmark index ${BENCH_INDEX} (HTTP ${refresh_code})"
   fi
 
-  rm -f -- "${settings_response}" "${refresh_response}"
+  rm -f -- "${settings_response}" "${merge_response}" "${refresh_response}"
 }
 
 count_index_documents() {
@@ -1065,13 +1170,17 @@ main() {
   printf '  BENCH_WARMUP_RUNS=%s\n' "${BENCH_WARMUP_RUNS}"
   printf '  BENCH_MEASURED_RUNS=%s\n' "${BENCH_MEASURED_RUNS}"
   printf '  BENCH_KEEP_ARTIFACTS=%s\n' "${BENCH_KEEP_ARTIFACTS}"
+  printf '  BENCH_CODEC=%s\n' "${BENCH_CODEC}"
+  printf '  BENCH_FORCE_MERGE=%s\n' "${BENCH_FORCE_MERGE}"
+  printf '  BENCH_MAX_NUM_SEGMENTS=%s\n' "${BENCH_MAX_NUM_SEGMENTS}"
+  printf '  BENCH_USE_EXPLICIT_IDS=%s\n' "${BENCH_USE_EXPLICIT_IDS}"
   printf '  BENCH_INDEX=%s\n' "${BENCH_INDEX}"
   printf '  WORKDIR=%s\n' "${WORKDIR}"
 
   delete_index_if_exists || die "Failed to delete existing benchmark index ${BENCH_INDEX}"
   create_index
   seed_index
-  refresh_index
+  prepare_index_for_reads
   seeded_docs="$(count_index_documents)"
   [[ "${seeded_docs}" == "${BENCH_DOCS}" ]] || die "Seeded document count mismatch: expected ${BENCH_DOCS}, got ${seeded_docs}"
   log "Seeded benchmark index ${BENCH_INDEX} with ${seeded_docs} documents"
