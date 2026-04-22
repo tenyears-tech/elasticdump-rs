@@ -4,9 +4,9 @@ use bytesize::ByteSize;
 use elasticsearch::{ClearScrollParts, Elasticsearch, http::response::Response};
 use http::StatusCode;
 use log::warn;
-use sonic_rs::{JsonValueMutTrait, Value, json};
 #[cfg(test)]
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+use sonic_rs::{JsonValueMutTrait, Value, json};
 use std::sync::atomic::Ordering;
 
 use super::{

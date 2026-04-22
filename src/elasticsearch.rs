@@ -52,7 +52,10 @@ pub fn parse_input_url(args: &Cli) -> Result<(Url, String, Option<String>, Optio
     let base_path = if normalized_segments.len() == 1 {
         "/".to_string()
     } else {
-        format!("/{}/", normalized_segments[..normalized_segments.len() - 1].join("/"))
+        format!(
+            "/{}/",
+            normalized_segments[..normalized_segments.len() - 1].join("/")
+        )
     };
     host_url.set_path(&base_path);
 

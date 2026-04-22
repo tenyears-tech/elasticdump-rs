@@ -46,13 +46,15 @@ impl OutputTarget {
             staging_path,
         } = &self.mode
         {
-            tokio_fs::rename(staging_path, final_path).await.with_context(|| {
-                format!(
-                    "Failed to move staged output '{}' into place at '{}'",
-                    staging_path.display(),
-                    final_path.display()
-                )
-            })?;
+            tokio_fs::rename(staging_path, final_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to move staged output '{}' into place at '{}'",
+                        staging_path.display(),
+                        final_path.display()
+                    )
+                })?;
         }
 
         Ok(())

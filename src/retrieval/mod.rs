@@ -415,9 +415,9 @@ mod tests {
             {
                 let pit_opened = Arc::clone(&pit_opened);
                 move || async move {
-                        pit_opened.store(true, Ordering::Relaxed);
-                        Ok::<_, anyhow::Error>("pit-opened")
-                    }
+                    pit_opened.store(true, Ordering::Relaxed);
+                    Ok::<_, anyhow::Error>("pit-opened")
+                }
             },
         )
         .await
