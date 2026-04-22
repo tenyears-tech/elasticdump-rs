@@ -17,9 +17,28 @@ pub(crate) struct BatchMetadata {
     pub(crate) hits_are_empty: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExtractedBatch {
+    pub(crate) metadata: BatchMetadata,
+    pub(crate) output: ExtractedOutputBatch,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ExtractedOutputBatch {
     pub(crate) buffer: Vec<u8>,
     pub(crate) doc_count: u64,
+}
+
+struct MetadataValues {
+    relation: Option<String>,
+    total_value: Option<u64>,
+    next_pit_id: Option<String>,
+    next_scroll_id: Option<String>,
+}
+
+struct MetadataInputs<'a> {
+    values: MetadataValues,
+    hits: LazyValue<'a>,
 }
 
 fn metadata_tree() -> &'static PointerTree {
@@ -78,10 +97,7 @@ fn count_hits_and_last_sort_raw<'a>(
     Ok((doc_count, last_sort_raw))
 }
 
-pub(crate) fn extract_batch_metadata(
-    response_bytes: &Bytes,
-    search_type: &SearchType,
-) -> Result<BatchMetadata> {
+fn extract_metadata_inputs(response_bytes: &Bytes) -> Result<MetadataInputs<'_>> {
     let mut values = get_many(response_bytes, metadata_tree())?;
     let hits = require_hits_array(values.pop().flatten())?;
     let relation = values
@@ -98,15 +114,30 @@ pub(crate) fn extract_batch_metadata(
         .flatten()
         .and_then(|value| value.as_str().map(str::to_owned));
 
-    let (doc_count, last_sort_raw) = count_hits_and_last_sort_raw(hits, search_type)?;
+    Ok(MetadataInputs {
+        values: MetadataValues {
+            relation,
+            total_value,
+            next_pit_id,
+            next_scroll_id,
+        },
+        hits,
+    })
+}
 
+fn finalize_metadata(
+    values: MetadataValues,
+    search_type: &SearchType,
+    doc_count: u64,
+    last_sort_raw: Option<Vec<u8>>,
+) -> Result<BatchMetadata> {
     if matches!(search_type, SearchType::PointInTime) && doc_count > 0 && last_sort_raw.is_none() {
         return Err(anyhow!(
             "PIT response contains hits but the final hit is missing a usable sort value"
         ));
     }
 
-    let total_hits = match (total_value, relation.as_deref()) {
+    let total_hits = match (values.total_value, values.relation.as_deref()) {
         (Some(value), Some("eq")) => TotalHitsEstimate {
             value,
             is_exact: true,
@@ -127,26 +158,23 @@ pub(crate) fn extract_batch_metadata(
 
     Ok(BatchMetadata {
         total_hits,
-        next_scroll_id,
-        next_pit_id,
+        next_scroll_id: values.next_scroll_id,
+        next_pit_id: values.next_pit_id,
         last_sort_raw,
         doc_count,
         hits_are_empty: doc_count == 0,
     })
 }
 
-pub(crate) fn build_output_batch(response_bytes: &Bytes) -> Result<ExtractedOutputBatch> {
-    let hits = sonic_rs::get(response_bytes, &["hits", "hits"]).map_err(|error| {
-        anyhow!(
-            "Failed to locate hits.hits for output extraction: {}",
-            error
-        )
-    })?;
+fn build_output_batch_from_hits(
+    hits: LazyValue<'_>,
+    response_bytes_len: usize,
+) -> Result<ExtractedOutputBatch> {
     let iter = hits
         .into_array_iter()
         .ok_or_else(|| anyhow!("Elasticsearch response field hits.hits is not iterable"))?;
 
-    let mut buffer = Vec::with_capacity(response_bytes.len());
+    let mut buffer = Vec::with_capacity(response_bytes_len);
     let mut doc_count = 0u64;
 
     for hit in iter {
@@ -159,10 +187,76 @@ pub(crate) fn build_output_batch(response_bytes: &Bytes) -> Result<ExtractedOutp
     Ok(ExtractedOutputBatch { buffer, doc_count })
 }
 
+pub(crate) fn extract_batch_metadata(
+    response_bytes: &Bytes,
+    search_type: &SearchType,
+) -> Result<BatchMetadata> {
+    let metadata_inputs = extract_metadata_inputs(response_bytes)?;
+    let (doc_count, last_sort_raw) =
+        count_hits_and_last_sort_raw(metadata_inputs.hits, search_type)?;
+
+    finalize_metadata(metadata_inputs.values, search_type, doc_count, last_sort_raw)
+}
+
+pub(crate) fn extract_batch(
+    response_bytes: &Bytes,
+    search_type: &SearchType,
+) -> Result<ExtractedBatch> {
+    let metadata_inputs = extract_metadata_inputs(response_bytes)?;
+    let iter = metadata_inputs
+        .hits
+        .into_array_iter()
+        .ok_or_else(|| anyhow!("Elasticsearch response field hits.hits is not iterable"))?;
+
+    let mut doc_count = 0u64;
+    let mut last_sort_raw = None;
+    let mut buffer = Vec::with_capacity(response_bytes.len());
+
+    for hit in iter {
+        let hit = hit?;
+        doc_count += 1;
+
+        buffer.extend_from_slice(hit.as_raw_str().as_bytes());
+        buffer.push(b'\n');
+
+        if matches!(search_type, SearchType::PointInTime) {
+            match hit.get("sort") {
+                Some(value) if value.is_array() => {
+                    let sort_buffer = last_sort_raw.get_or_insert_with(Vec::new);
+                    sort_buffer.clear();
+                    sort_buffer.extend_from_slice(value.as_raw_str().as_bytes());
+                }
+                _ => {
+                    last_sort_raw = None;
+                }
+            }
+        }
+    }
+
+    let metadata =
+        finalize_metadata(metadata_inputs.values, search_type, doc_count, last_sort_raw)?;
+
+    Ok(ExtractedBatch {
+        metadata,
+        output: ExtractedOutputBatch { buffer, doc_count },
+    })
+}
+
+pub(crate) fn build_output_batch(response_bytes: &Bytes) -> Result<ExtractedOutputBatch> {
+    let hits = sonic_rs::get(response_bytes, &["hits", "hits"]).map_err(|error| {
+        anyhow!(
+            "Failed to locate hits.hits for output extraction: {}",
+            error
+        )
+    })?;
+
+    build_output_batch_from_hits(hits, response_bytes.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_output_batch, count_hits_and_last_sort_raw, extract_batch_metadata,
+        build_output_batch, count_hits_and_last_sort_raw, extract_batch, extract_batch_metadata,
         require_hits_array,
     };
     use crate::cli::SearchType;
@@ -312,6 +406,102 @@ mod tests {
         assert!(output.contains(r#"{"_id":"1","_source":{"name":"a","nested":{"x":1}}}"#));
         assert!(output.contains(r#"{"_id":"2","_source":{"name":"b","tags":["t1","t2"]}}"#));
         assert_eq!(output.lines().count(), 2);
+    }
+
+    #[test]
+    fn build_output_batch_preserves_original_hit_json_for_pit_response() {
+        let response = Bytes::from_static(
+            br#"{
+                "pit_id":"pit-next",
+                "hits":{
+                    "total":{"value":2,"relation":"eq"},
+                    "hits":[
+                        {"_id":"1","sort":[1,"a"],"_source":{"name":"a","nested":{"x":1}}},
+                        {"_id":"2","sort":[2,{"nested":true}],"_source":{"name":"b","tags":["t1","t2"]}}
+                    ]
+                }
+            }"#,
+        );
+
+        let batch = build_output_batch(&response).unwrap();
+        let output = String::from_utf8(batch.buffer).unwrap();
+
+        assert_eq!(batch.doc_count, 2);
+        assert!(output.contains(
+            r#"{"_id":"1","sort":[1,"a"],"_source":{"name":"a","nested":{"x":1}}}"#
+        ));
+        assert!(output.contains(
+            r#"{"_id":"2","sort":[2,{"nested":true}],"_source":{"name":"b","tags":["t1","t2"]}}"#
+        ));
+        assert_eq!(output.lines().count(), 2);
+    }
+
+    #[test]
+    fn extract_batch_fuses_pit_metadata_and_output() {
+        let response = Bytes::from_static(
+            br#"{
+                "pit_id":"pit-next",
+                "hits":{
+                    "total":{"value":2,"relation":"gte"},
+                    "hits":[
+                        {"_id":"1","sort":[1,"a"],"_source":{"name":"a"}},
+                        {"_id":"2","sort":[2,{"nested":true}],"_source":{"name":"b"}}
+                    ]
+                }
+            }"#,
+        );
+
+        let extracted = extract_batch(&response, &SearchType::PointInTime).unwrap();
+
+        assert_eq!(extracted.metadata.next_pit_id.as_deref(), Some("pit-next"));
+        assert_eq!(extracted.metadata.total_hits.value, 2);
+        assert!(!extracted.metadata.total_hits.is_exact);
+        assert_eq!(
+            extracted.metadata.last_sort_raw.as_deref(),
+            Some(br#"[2,{"nested":true}]"#.as_slice())
+        );
+        assert_eq!(extracted.output.doc_count, 2);
+        assert_eq!(
+            String::from_utf8(extracted.output.buffer).unwrap(),
+            concat!(
+                "{\"_id\":\"1\",\"sort\":[1,\"a\"],\"_source\":{\"name\":\"a\"}}\n",
+                "{\"_id\":\"2\",\"sort\":[2,{\"nested\":true}],\"_source\":{\"name\":\"b\"}}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn extract_batch_fuses_scroll_metadata_and_output() {
+        let response = Bytes::from_static(
+            br#"{
+                "_scroll_id":"scroll-next",
+                "hits":{
+                    "total":{"value":2,"relation":"eq"},
+                    "hits":[
+                        {"_id":"1","_source":{"name":"a"}},
+                        {"_id":"2","_source":{"name":"b"}}
+                    ]
+                }
+            }"#,
+        );
+
+        let extracted = extract_batch(&response, &SearchType::Scroll).unwrap();
+
+        assert_eq!(
+            extracted.metadata.next_scroll_id.as_deref(),
+            Some("scroll-next")
+        );
+        assert_eq!(extracted.metadata.total_hits.value, 2);
+        assert!(extracted.metadata.total_hits.is_exact);
+        assert!(extracted.metadata.last_sort_raw.is_none());
+        assert_eq!(extracted.output.doc_count, 2);
+        assert_eq!(
+            String::from_utf8(extracted.output.buffer).unwrap(),
+            concat!(
+                "{\"_id\":\"1\",\"_source\":{\"name\":\"a\"}}\n",
+                "{\"_id\":\"2\",\"_source\":{\"name\":\"b\"}}\n"
+            )
+        );
     }
 
     #[test]

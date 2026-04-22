@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use elasticsearch::{Elasticsearch, ScrollParts, SearchParts};
+use elasticsearch::{ScrollParts, SearchParts};
 use log::{debug, info};
 use sonic_rs::{Value, json};
 
@@ -9,7 +9,7 @@ use super::{
     context::RetrievalContext,
     extract::BatchMetadata,
     retrieval_task::{
-        TotalHitsEstimate, cleanup_search_context, dispatch_response_batch,
+        TotalHitsEstimate, cleanup_search_context, process_response_batch,
         read_checked_response_bytes, record_total_hits,
     },
     slice_state::SliceState,
@@ -24,23 +24,6 @@ pub(crate) fn build_scroll_request_body(scroll_ttl: &str, scroll_id: &str) -> Va
 
 pub(crate) fn apply_scroll_batch_metadata(state: &mut SliceState, metadata: &BatchMetadata) {
     state.current_id = metadata.next_scroll_id.clone();
-}
-
-pub(crate) async fn extract_scroll_batch_metadata(
-    client: &Elasticsearch,
-    slice_id: usize,
-    current_scroll_id: Option<&str>,
-    response_bytes: &bytes::Bytes,
-) -> Result<BatchMetadata> {
-    match super::extract::extract_batch_metadata(response_bytes, &SearchType::Scroll) {
-        Ok(metadata) => Ok(metadata),
-        Err(error) => {
-            if let Some(scroll_id) = current_scroll_id {
-                cleanup_search_context(client, &SearchType::Scroll, scroll_id, slice_id).await;
-            }
-            Err(error)
-        }
-    }
 }
 
 pub(crate) async fn run_scroll_slice(
@@ -85,8 +68,27 @@ pub(crate) async fn run_scroll_slice(
         state.slice_id, initial_bytes
     );
 
-    let metadata =
-        extract_scroll_batch_metadata(&ctx.client, state.slice_id, None, &response_bytes).await?;
+    let metadata = match process_response_batch(
+        ctx,
+        state,
+        response_bytes,
+        &SearchType::Scroll,
+        initial_bytes,
+    )
+    .await
+    {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if let Some(metadata) = error.metadata() {
+                apply_scroll_batch_metadata(state, metadata);
+            }
+            if let Some(scroll_id) = state.current_id.as_deref() {
+                cleanup_search_context(&ctx.client, &SearchType::Scroll, scroll_id, state.slice_id)
+                    .await;
+            }
+            return Err(error.into_error());
+        }
+    };
     apply_scroll_batch_metadata(state, &metadata);
     if let Some(id) = &state.current_id {
         debug!("Slice {}: Got scroll_id: {}", state.slice_id, id);
@@ -100,25 +102,7 @@ pub(crate) async fn run_scroll_slice(
         state.slice_id, slice_total_hits.value, slice_total_hits.is_exact
     );
 
-    let mut done = match dispatch_response_batch(
-        ctx,
-        state,
-        response_bytes,
-        metadata.doc_count,
-        metadata.hits_are_empty,
-        initial_bytes,
-    )
-    .await
-    {
-        Ok(hits_are_empty) => hits_are_empty,
-        Err(error) => {
-            if let Some(scroll_id) = state.current_id.as_deref() {
-                cleanup_search_context(&ctx.client, &SearchType::Scroll, scroll_id, state.slice_id)
-                    .await;
-            }
-            return Err(error);
-        }
-    };
+    let mut done = metadata.hits_are_empty;
 
     while !done {
         let next_response = match ctx
@@ -184,27 +168,20 @@ pub(crate) async fn run_scroll_slice(
             state.slice_id, batch_bytes
         );
 
-        let metadata = extract_scroll_batch_metadata(
-            &ctx.client,
-            state.slice_id,
-            state.current_id.as_deref(),
-            &next_response_bytes,
-        )
-        .await?;
-        apply_scroll_batch_metadata(state, &metadata);
-
-        done = match dispatch_response_batch(
+        let metadata = match process_response_batch(
             ctx,
             state,
             next_response_bytes,
-            metadata.doc_count,
-            metadata.hits_are_empty,
+            &SearchType::Scroll,
             batch_bytes,
         )
         .await
         {
-            Ok(hits_are_empty) => hits_are_empty,
+            Ok(metadata) => metadata,
             Err(error) => {
+                if let Some(metadata) = error.metadata() {
+                    apply_scroll_batch_metadata(state, metadata);
+                }
                 if let Some(scroll_id) = state.current_id.as_deref() {
                     cleanup_search_context(
                         &ctx.client,
@@ -214,9 +191,12 @@ pub(crate) async fn run_scroll_slice(
                     )
                     .await;
                 }
-                return Err(error);
+                return Err(error.into_error());
             }
         };
+        apply_scroll_batch_metadata(state, &metadata);
+
+        done = metadata.hits_are_empty;
 
         if done {
             info!(

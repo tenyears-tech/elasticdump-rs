@@ -8,10 +8,13 @@ use log::warn;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 use sonic_rs::{JsonValueMutTrait, Value, json};
 use std::sync::atomic::Ordering;
+use tokio::sync::oneshot;
 
 use super::{
-    context::RetrievalContext, messages::RetrievalMessage, pit::SharedPitCoordinator, pit_search,
-    scroll, slice_state::SliceState,
+    context::RetrievalContext,
+    messages::{BatchJob, BatchProcessingFailure, RetrievalMessage},
+    pit::SharedPitCoordinator,
+    pit_search, scroll, slice_state::SliceState,
 };
 use crate::cli::SearchType;
 
@@ -118,16 +121,62 @@ pub(crate) fn record_total_hits(
     estimate
 }
 
-pub(crate) async fn dispatch_response_batch(
+pub(crate) async fn process_response_batch(
     ctx: &RetrievalContext,
     state: &mut SliceState,
     response_bytes: Bytes,
-    doc_count: u64,
-    hits_are_empty: bool,
+    search_type: &SearchType,
     batch_bytes: u64,
-) -> Result<bool> {
-    state.retrieved_hits += doc_count;
-    let current_retrieved = ctx.retrieved_count.fetch_add(doc_count, Ordering::Relaxed) + doc_count;
+) -> std::result::Result<super::extract::BatchMetadata, BatchProcessingFailure> {
+    let recovery_bytes = response_bytes.clone();
+    let worker = state.dispatch_worker(ctx.worker_txs.len());
+    let (reply_tx, reply_rx) = oneshot::channel();
+    ctx.worker_txs[worker]
+        .send(RetrievalMessage::Batch(BatchJob {
+            response_bytes,
+            search_type: search_type.clone(),
+            reply_tx,
+        }))
+        .await
+        .map_err(|error| recover_batch_processing_failure(
+            BatchProcessingFailure::from(anyhow!(
+                "Failed to send batch to worker {} for slice {}: {}",
+                worker,
+                state.slice_id,
+                error
+            )),
+            &recovery_bytes,
+            search_type,
+        ))?;
+
+    let metadata = match reply_rx.await {
+        Ok(Ok(metadata)) => metadata,
+        Ok(Err(failure)) => {
+            return Err(recover_batch_processing_failure(
+                failure,
+                &recovery_bytes,
+                search_type,
+            ));
+        }
+        Err(error) => {
+            return Err(recover_batch_processing_failure(
+                BatchProcessingFailure::from(anyhow!(
+            "Worker {} dropped metadata reply for slice {}: {}",
+            worker,
+            state.slice_id,
+            error
+                )),
+                &recovery_bytes,
+                search_type,
+            ));
+        }
+    };
+
+    state.retrieved_hits += metadata.doc_count;
+    let current_retrieved = ctx
+        .retrieved_count
+        .fetch_add(metadata.doc_count, Ordering::Relaxed)
+        + metadata.doc_count;
     let current_bytes = ctx
         .retrieved_bytes
         .fetch_add(batch_bytes, Ordering::Relaxed)
@@ -143,24 +192,17 @@ pub(crate) async fn dispatch_response_batch(
         ));
     }
 
-    if doc_count == 0 {
-        return Ok(hits_are_empty);
-    }
+    Ok(metadata)
+}
 
-    let worker = state.dispatch_worker(ctx.worker_txs.len());
-    ctx.worker_txs[worker]
-        .send(RetrievalMessage::Batch(response_bytes))
-        .await
-        .map_err(|error| {
-            anyhow!(
-                "Failed to send batch to worker {} for slice {}: {}",
-                worker,
-                state.slice_id,
-                error
-            )
-        })?;
-
-    Ok(hits_are_empty)
+fn recover_batch_processing_failure(
+    failure: BatchProcessingFailure,
+    response_bytes: &Bytes,
+    search_type: &SearchType,
+) -> BatchProcessingFailure {
+    failure.with_fallback_metadata(
+        super::extract::extract_batch_metadata(response_bytes, search_type).ok(),
+    )
 }
 
 pub(crate) async fn cleanup_search_context(
@@ -208,6 +250,7 @@ pub fn spawn_retrieval_task(
 mod tests {
     use bytes::Bytes;
     use http::StatusCode;
+    use indicatif::{ProgressBar, ProgressDrawTarget};
     use sonic_rs::json;
     use std::{
         sync::{Arc, atomic::AtomicU64},
@@ -216,8 +259,11 @@ mod tests {
     use tokio::sync::mpsc;
     use url::Url;
 
+    use crate::cli::SearchType;
+
     use super::super::{
         context::RetrievalContext, messages::RetrievalMessage, slice_state::SliceState,
+        worker::spawn_worker_task,
     };
 
     fn test_context(worker_txs: Vec<mpsc::Sender<RetrievalMessage>>) -> RetrievalContext {
@@ -347,18 +393,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_response_batch_skips_empty_batches() {
-        let (worker_tx, mut worker_rx) = mpsc::channel(1);
-        let ctx = test_context(vec![worker_tx]);
-        let mut state = SliceState::new(0, 0, json!({"size": 10}));
-        let response_bytes = Bytes::from_static(br#"{"hits":{"hits":[]}}"#);
+    async fn process_response_batch_returns_worker_metadata_and_updates_counters() {
+        let (worker_tx, worker_rx) = mpsc::channel(2);
+        let (processed_tx, mut processed_rx) = mpsc::channel(2);
+        let worker = spawn_worker_task(
+            0,
+            worker_rx,
+            processed_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Instant::now(),
+        )
+        .unwrap();
 
-        let hits_are_empty =
-            super::dispatch_response_batch(&ctx, &mut state, response_bytes, 0, true, 19)
-                .await
-                .unwrap();
+        let mut ctx = test_context(vec![worker_tx]);
+        let input_bar = ProgressBar::new(0);
+        input_bar.set_draw_target(ProgressDrawTarget::hidden());
+        ctx.input_bar = Some(input_bar.clone());
 
-        assert!(hits_are_empty);
+        let mut state = SliceState::new(3, 0, json!({"size": 10}));
+        let response_bytes = Bytes::from_static(
+            br#"{"pit_id":"pit-next","hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"1","sort":[1,"a"],"_source":{"message":"a"}}]}}"#,
+        );
+
+        let metadata = super::process_response_batch(
+            &ctx,
+            &mut state,
+            response_bytes,
+            &SearchType::PointInTime,
+            130,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-next"));
+        assert_eq!(metadata.last_sort_raw.as_deref(), Some(br#"[1,"a"]"#.as_slice()));
+        assert!(metadata.next_scroll_id.is_none());
+        assert_eq!(metadata.doc_count, 1);
+        assert!(!metadata.hits_are_empty);
+        assert_eq!(metadata.total_hits.value, 1);
+        assert!(metadata.total_hits.is_exact);
+
+        assert_eq!(state.retrieved_hits, 1);
+        assert_eq!(
+            ctx.retrieved_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            ctx.retrieved_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            130
+        );
+        assert_eq!(input_bar.position(), 1);
+        assert!(state.current_id.is_none());
+        assert!(state.search_after.is_none());
+
+        let processed = processed_rx.recv().await.unwrap();
+        assert_eq!(processed.doc_count, 1);
+        assert_eq!(
+            String::from_utf8(processed.buffer).unwrap(),
+            "{\"_id\":\"1\",\"sort\":[1,\"a\"],\"_source\":{\"message\":\"a\"}}\n"
+        );
+
+        ctx.worker_txs[0].send(RetrievalMessage::Done).await.unwrap();
+        worker.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_response_batch_preserves_metadata_when_worker_fails_after_extraction() {
+        let (worker_tx, worker_rx) = mpsc::channel(1);
+        let (processed_tx, processed_rx) = mpsc::channel(1);
+        drop(processed_rx);
+
+        let worker = spawn_worker_task(
+            0,
+            worker_rx,
+            processed_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+
+        let mut ctx = test_context(vec![worker_tx]);
+        let input_bar = ProgressBar::new(0);
+        input_bar.set_draw_target(ProgressDrawTarget::hidden());
+        ctx.input_bar = Some(input_bar.clone());
+
+        let mut state = SliceState::new(7, 0, json!({"size": 10}));
+        let response_bytes = Bytes::from_static(
+            br#"{"pit_id":"pit-after-failure","hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"1","sort":[9,"z"],"_source":{"message":"z"}}]}}"#,
+        );
+
+        let failure = super::process_response_batch(
+            &ctx,
+            &mut state,
+            response_bytes,
+            &SearchType::PointInTime,
+            144,
+        )
+        .await
+        .unwrap_err();
+
+        let metadata = failure.metadata().expect("metadata should survive failure");
+        assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-after-failure"));
+        assert_eq!(metadata.last_sort_raw.as_deref(), Some(br#"[9,"z"]"#.as_slice()));
+        assert_eq!(metadata.doc_count, 1);
+        assert!(!metadata.hits_are_empty);
+        assert!(failure
+            .into_error()
+            .to_string()
+            .contains("Failed to send processed batch"));
+
         assert_eq!(state.retrieved_hits, 0);
         assert_eq!(
             ctx.retrieved_count
@@ -368,8 +517,58 @@ mod tests {
         assert_eq!(
             ctx.retrieved_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
-            19
+            0
         );
-        assert!(worker_rx.try_recv().is_err());
+        assert_eq!(input_bar.position(), 0);
+
+        let worker_error = worker.wait().await.unwrap_err().to_string();
+        assert!(worker_error.contains("Failed to send processed batch"));
+    }
+
+    #[tokio::test]
+    async fn process_response_batch_preserves_metadata_when_worker_channel_is_closed() {
+        let (worker_tx, worker_rx) = mpsc::channel(1);
+        drop(worker_rx);
+
+        let ctx = test_context(vec![worker_tx]);
+        let mut state = SliceState::new(9, 0, json!({"size": 10}));
+        let response_bytes = Bytes::from_static(
+            br#"{"pit_id":"pit-send-failed","hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"1","sort":[11,"send"],"_source":{"message":"send"}}]}}"#,
+        );
+
+        let failure = super::process_response_batch(
+            &ctx,
+            &mut state,
+            response_bytes,
+            &SearchType::PointInTime,
+            151,
+        )
+        .await
+        .unwrap_err();
+
+        let metadata = failure.metadata().expect("metadata should be recovered locally");
+        assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-send-failed"));
+        assert_eq!(
+            metadata.last_sort_raw.as_deref(),
+            Some(br#"[11,"send"]"#.as_slice())
+        );
+        assert_eq!(metadata.doc_count, 1);
+        assert!(!metadata.hits_are_empty);
+        assert!(failure
+            .into_error()
+            .to_string()
+            .contains("Failed to send batch to worker"));
+
+        assert_eq!(state.retrieved_hits, 0);
+        assert_eq!(
+            ctx.retrieved_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            ctx.retrieved_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

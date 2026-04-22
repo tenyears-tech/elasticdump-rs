@@ -7,10 +7,10 @@ use crate::cli::SearchType;
 
 use super::{
     context::RetrievalContext,
-    extract::{self, BatchMetadata},
+    extract::BatchMetadata,
     pit::SharedPitCoordinator,
     retrieval_task::{
-        TotalHitsEstimate, abort_shared_pit, dispatch_response_batch, ensure_pit_sort,
+        TotalHitsEstimate, abort_shared_pit, ensure_pit_sort, process_response_batch,
         read_checked_response_bytes, record_total_hits,
     },
     slice_state::SliceState,
@@ -123,10 +123,24 @@ pub(crate) async fn run_pit_slice(
         state.slice_id, initial_bytes
     );
 
-    let metadata = match extract::extract_batch_metadata(&response_bytes, &SearchType::PointInTime)
+    let metadata = match process_response_batch(
+        ctx,
+        state,
+        response_bytes,
+        &SearchType::PointInTime,
+        initial_bytes,
+    )
+    .await
     {
         Ok(metadata) => metadata,
         Err(error) => {
+            if let Some(metadata) = error.metadata() {
+                apply_pit_batch_metadata(state, metadata);
+                shared_pit
+                    .observe_returned_id(state.current_id.as_deref())
+                    .await;
+            }
+            let error = error.into_error();
             abort_shared_pit(&Some(shared_pit.clone()), &error).await;
             return Err(error);
         }
@@ -143,22 +157,7 @@ pub(crate) async fn run_pit_slice(
         .observe_returned_id(state.current_id.as_deref())
         .await;
 
-    let initial_hits_are_empty = match dispatch_response_batch(
-        ctx,
-        state,
-        response_bytes,
-        metadata.doc_count,
-        metadata.hits_are_empty,
-        initial_bytes,
-    )
-    .await
-    {
-        Ok(hits_are_empty) => hits_are_empty,
-        Err(error) => {
-            abort_shared_pit(&Some(shared_pit.clone()), &anyhow!(error.to_string())).await;
-            return Err(error);
-        }
-    };
+    let initial_hits_are_empty = metadata.hits_are_empty;
 
     if let Err(error) = shared_pit
         .complete_round(
@@ -251,14 +250,28 @@ pub(crate) async fn run_pit_slice(
             state.slice_id, batch_bytes
         );
 
-        let metadata =
-            match extract::extract_batch_metadata(&next_response_bytes, &SearchType::PointInTime) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    abort_shared_pit(&Some(shared_pit.clone()), &error).await;
-                    return Err(error);
+        let metadata = match process_response_batch(
+            ctx,
+            state,
+            next_response_bytes,
+            &SearchType::PointInTime,
+            batch_bytes,
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if let Some(metadata) = error.metadata() {
+                    apply_pit_batch_metadata(state, metadata);
+                    shared_pit
+                        .observe_returned_id(state.current_id.as_deref())
+                        .await;
                 }
-            };
+                let error = error.into_error();
+                abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+                return Err(error);
+            }
+        };
 
         debug!(
             "Slice {}: Continuation metadata: pit_id={:?}, doc_count={}, hits_are_empty={}",
@@ -270,22 +283,7 @@ pub(crate) async fn run_pit_slice(
             .observe_returned_id(state.current_id.as_deref())
             .await;
 
-        let hits_are_empty = match dispatch_response_batch(
-            ctx,
-            state,
-            next_response_bytes,
-            metadata.doc_count,
-            metadata.hits_are_empty,
-            batch_bytes,
-        )
-        .await
-        {
-            Ok(hits_are_empty) => hits_are_empty,
-            Err(error) => {
-                abort_shared_pit(&Some(shared_pit.clone()), &anyhow!(error.to_string())).await;
-                return Err(error);
-            }
-        };
+        let hits_are_empty = metadata.hits_are_empty;
 
         if let Err(error) = shared_pit
             .complete_round(
