@@ -18,17 +18,17 @@ tokio = { version = "1", features = ["full"] }
 elasticsearch = { version = "8.17.0-alpha.1", features = [
     "rustls-tls",
 ], default-features = false }
-clap = { version = "4", features = ["derive"] }
-sonic-rs = "0.5"
-anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+sonic-rs = "0.5.8"
+anyhow = "1.0.102"
 log = "0.4"
 env_logger = "0.11"
 indicatif = "0.17"
-bytes = "1"
-url = "2"
+bytes = "1.11.1"
+url = "2.4"
 base64 = "0.22"
-http = "1"
-bytesize = "2"
+http = "1.3"
+bytesize = "2.0"
 console = "0.15"
 
 [dev-dependencies]
