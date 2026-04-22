@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use sonic_rs::{FastStr, JsonValueTrait, LazyValue, PointerTree, get_many, pointer};
+use sonic_rs::{JsonValueTrait, LazyValue, PointerTree, get_many, pointer};
 use std::sync::OnceLock;
 
 use crate::cli::SearchType;
@@ -50,7 +50,7 @@ fn require_hits_array<'a>(hits: Option<LazyValue<'a>>) -> Result<LazyValue<'a>> 
 fn count_hits_and_last_sort_raw<'a>(
     hits: LazyValue<'a>,
     search_type: &SearchType,
-) -> Result<(u64, Option<FastStr>)> {
+) -> Result<(u64, Option<Vec<u8>>)> {
     let mut doc_count = 0u64;
     let mut last_sort_raw = None;
     let iter = hits
@@ -62,10 +62,16 @@ fn count_hits_and_last_sort_raw<'a>(
         doc_count += 1;
 
         if matches!(search_type, SearchType::PointInTime) {
-            last_sort_raw = match hit.get("sort") {
-                Some(value) if value.is_array() => Some(value.as_raw_faststr()),
-                _ => None,
-            };
+            match hit.get("sort") {
+                Some(value) if value.is_array() => {
+                    let buffer = last_sort_raw.get_or_insert_with(Vec::new);
+                    buffer.clear();
+                    buffer.extend_from_slice(value.as_raw_str().as_bytes());
+                }
+                _ => {
+                    last_sort_raw = None;
+                }
+            }
         }
     }
 
@@ -93,7 +99,6 @@ pub(crate) fn extract_batch_metadata(
         .and_then(|value| value.as_str().map(str::to_owned));
 
     let (doc_count, last_sort_raw) = count_hits_and_last_sort_raw(hits, search_type)?;
-    let last_sort_raw = last_sort_raw.map(|value| value.as_bytes().to_vec());
 
     if matches!(search_type, SearchType::PointInTime) && doc_count > 0 && last_sort_raw.is_none() {
         return Err(anyhow!(
@@ -233,10 +238,12 @@ mod tests {
             require_hits_array(Some(sonic_rs::get(&response, &["hits", "hits"]).unwrap())).unwrap();
         let (doc_count, last_sort_raw) =
             count_hits_and_last_sort_raw(hits, &SearchType::PointInTime).unwrap();
-        let last_sort_raw = last_sort_raw.unwrap();
 
         assert_eq!(doc_count, 2);
-        assert_eq!(last_sort_raw.as_str(), r#"[2,{"nested":true}]"#);
+        assert_eq!(
+            last_sort_raw.as_deref(),
+            Some(br#"[2,{"nested":true}]"#.as_slice())
+        );
     }
 
     #[test]
