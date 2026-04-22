@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use sonic_rs::{JsonValueTrait, LazyValue, PointerTree, get_many, pointer};
+use sonic_rs::{FastStr, JsonValueTrait, LazyValue, PointerTree, get_many, pointer};
 use std::sync::OnceLock;
 
 use crate::cli::SearchType;
@@ -47,6 +47,31 @@ fn require_hits_array<'a>(hits: Option<LazyValue<'a>>) -> Result<LazyValue<'a>> 
     Ok(hits)
 }
 
+fn count_hits_and_last_sort_raw<'a>(
+    hits: LazyValue<'a>,
+    search_type: &SearchType,
+) -> Result<(u64, Option<FastStr>)> {
+    let mut doc_count = 0u64;
+    let mut last_sort_raw = None;
+    let iter = hits
+        .into_array_iter()
+        .ok_or_else(|| anyhow!("Elasticsearch response field hits.hits is not iterable"))?;
+
+    for hit in iter {
+        let hit = hit?;
+        doc_count += 1;
+
+        if matches!(search_type, SearchType::PointInTime) {
+            last_sort_raw = match hit.get("sort") {
+                Some(value) if value.is_array() => Some(value.as_raw_faststr()),
+                _ => None,
+            };
+        }
+    }
+
+    Ok((doc_count, last_sort_raw))
+}
+
 pub(crate) fn extract_batch_metadata(
     response_bytes: &Bytes,
     search_type: &SearchType,
@@ -67,25 +92,8 @@ pub(crate) fn extract_batch_metadata(
         .flatten()
         .and_then(|value| value.as_str().map(str::to_owned));
 
-    let mut doc_count = 0u64;
-    let mut last_sort_raw = None;
-    let iter = hits
-        .into_array_iter()
-        .ok_or_else(|| anyhow!("Elasticsearch response field hits.hits is not iterable"))?;
-
-    for hit in iter {
-        let hit = hit?;
-        doc_count += 1;
-        if matches!(search_type, SearchType::PointInTime) {
-            last_sort_raw = hit
-                .get("sort")
-                .and_then(|value| {
-                    value
-                        .is_array()
-                        .then(|| value.as_raw_str().as_bytes().to_vec())
-                });
-        }
-    }
+    let (doc_count, last_sort_raw) = count_hits_and_last_sort_raw(hits, search_type)?;
+    let last_sort_raw = last_sort_raw.map(|value| value.as_bytes().to_vec());
 
     if matches!(search_type, SearchType::PointInTime) && doc_count > 0 && last_sort_raw.is_none() {
         return Err(anyhow!(
@@ -123,8 +131,12 @@ pub(crate) fn extract_batch_metadata(
 }
 
 pub(crate) fn build_output_batch(response_bytes: &Bytes) -> Result<ExtractedOutputBatch> {
-    let hits = sonic_rs::get(response_bytes, &["hits", "hits"])
-        .map_err(|error| anyhow!("Failed to locate hits.hits for output extraction: {}", error))?;
+    let hits = sonic_rs::get(response_bytes, &["hits", "hits"]).map_err(|error| {
+        anyhow!(
+            "Failed to locate hits.hits for output extraction: {}",
+            error
+        )
+    })?;
     let iter = hits
         .into_array_iter()
         .ok_or_else(|| anyhow!("Elasticsearch response field hits.hits is not iterable"))?;
@@ -144,7 +156,10 @@ pub(crate) fn build_output_batch(response_bytes: &Bytes) -> Result<ExtractedOutp
 
 #[cfg(test)]
 mod tests {
-    use super::{build_output_batch, extract_batch_metadata};
+    use super::{
+        build_output_batch, count_hits_and_last_sort_raw, extract_batch_metadata,
+        require_hits_array,
+    };
     use crate::cli::SearchType;
     use bytes::Bytes;
 
@@ -198,6 +213,30 @@ mod tests {
             Some(br#"[2,"b"]"#.as_slice())
         );
         assert_eq!(metadata.doc_count, 2);
+    }
+
+    #[test]
+    fn count_hits_and_last_pit_sort_reads_raw_json_without_vec_per_hit() {
+        let response = Bytes::from_static(
+            br#"{
+                "pit_id":"pit-next",
+                "hits":{
+                    "hits":[
+                        {"_id":"1","sort":[1,"a"],"_source":{"name":"a"}},
+                        {"_id":"2","sort":[2,{"nested":true}],"_source":{"name":"b"}}
+                    ]
+                }
+            }"#,
+        );
+
+        let hits =
+            require_hits_array(Some(sonic_rs::get(&response, &["hits", "hits"]).unwrap())).unwrap();
+        let (doc_count, last_sort_raw) =
+            count_hits_and_last_sort_raw(hits, &SearchType::PointInTime).unwrap();
+        let last_sort_raw = last_sort_raw.unwrap();
+
+        assert_eq!(doc_count, 2);
+        assert_eq!(last_sort_raw.as_str(), r#"[2,{"nested":true}]"#);
     }
 
     #[test]

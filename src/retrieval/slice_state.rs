@@ -30,7 +30,16 @@ impl SliceState {
     }
 
     pub(crate) fn update_search_after_from_raw(&mut self, raw_sort: Option<&[u8]>) {
-        self.search_after = raw_sort.map(|value| value.to_vec());
+        match raw_sort {
+            Some(value) => {
+                let search_after = self.search_after.get_or_insert_with(Vec::new);
+                search_after.clear();
+                search_after.extend_from_slice(value);
+            }
+            None => {
+                self.search_after = None;
+            }
+        }
     }
 }
 
