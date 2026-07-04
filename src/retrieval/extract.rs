@@ -202,7 +202,12 @@ pub(crate) fn extract_batch_metadata(
     let (doc_count, last_sort_raw) =
         count_hits_and_last_sort_raw(metadata_inputs.hits, search_type)?;
 
-    finalize_metadata(metadata_inputs.values, search_type, doc_count, last_sort_raw)
+    finalize_metadata(
+        metadata_inputs.values,
+        search_type,
+        doc_count,
+        last_sort_raw,
+    )
 }
 
 pub(crate) fn extract_batch(
@@ -240,8 +245,12 @@ pub(crate) fn extract_batch(
         }
     }
 
-    let metadata =
-        finalize_metadata(metadata_inputs.values, search_type, doc_count, last_sort_raw)?;
+    let metadata = finalize_metadata(
+        metadata_inputs.values,
+        search_type,
+        doc_count,
+        last_sort_raw,
+    )?;
 
     Ok(ExtractedBatch {
         metadata,
