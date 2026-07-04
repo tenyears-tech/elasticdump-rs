@@ -16,16 +16,36 @@ use std::{
 };
 use url::Url;
 
+// Nested under the single integration-test target: only `.rs` files directly in
+// `tests/` become their own test crates, so `support/` stays a plain module.
+mod support;
+use support::mock_es::{CannedResponse, MockEs};
+
 const ES_URL: &str = "http://localhost:9200";
 const TEST_INDEX_PREFIX: &str = "elasticdump_rs_test";
 
 // Static counter to ensure unique index names for parallel test execution
 static INDEX_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-// Helper function to get a unique test index name
+// Helper function to get a unique test index name. The process id keeps two
+// concurrent `cargo test` processes sharing one ES node from colliding, and the
+// per-process counter keeps parallel tests within a process distinct.
 fn get_unique_test_index() -> String {
     let counter = INDEX_COUNTER.fetch_add(1, Ordering::SeqCst);
-    format!("{}_{}", TEST_INDEX_PREFIX, counter)
+    format!("{}_{}_{}", TEST_INDEX_PREFIX, std::process::id(), counter)
+}
+
+// A process-and-counter-unique output path under the system temp dir, so file
+// outputs never collide across concurrent test processes and never litter the
+// working tree.
+fn unique_output_path(label: &str) -> std::path::PathBuf {
+    let counter = INDEX_COUNTER.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!(
+        "elasticdump_rs_{}_{}_{}.jsonl",
+        label,
+        std::process::id(),
+        counter
+    ))
 }
 
 // Helper function to wait for Elasticsearch to be available
@@ -259,7 +279,7 @@ async fn setup_test_data(test_index: &str) -> Result<()> {
     // Refresh the index
     client
         .indices()
-        .refresh(IndicesRefreshParts::Index(&[&test_index]))
+        .refresh(IndicesRefreshParts::Index(&[test_index]))
         .send()
         .await?;
 
@@ -271,8 +291,24 @@ fn elasticdump_binary() -> &'static str {
     env!("CARGO_BIN_EXE_elasticdump-rs")
 }
 
+/// A `Command` for the binary with any ambient HTTP proxy disabled, so requests
+/// to the loopback mock server (and to localhost ES) connect directly instead
+/// of being intercepted by a developer machine's system proxy.
+fn binary_command() -> Command {
+    let mut cmd = Command::new(elasticdump_binary());
+    cmd.env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env("NO_PROXY", "127.0.0.1,localhost,::1")
+        .env("no_proxy", "127.0.0.1,localhost,::1");
+    cmd
+}
+
 fn run_elasticdump_command(args: &[&str]) -> Result<()> {
-    let status = Command::new(elasticdump_binary())
+    let status = binary_command()
         .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -284,10 +320,7 @@ fn run_elasticdump_command(args: &[&str]) -> Result<()> {
 }
 
 fn run_elasticdump_command_capture(args: &[&str]) -> Result<std::process::Output> {
-    Command::new(elasticdump_binary())
-        .args(args)
-        .output()
-        .map_err(Into::into)
+    binary_command().args(args).output().map_err(Into::into)
 }
 
 // Cleanup test data
@@ -430,8 +463,8 @@ async fn test_stdout_output() -> Result<()> {
     setup_test_data(&test_index).await?;
 
     // Run elasticdump-rs with output to stdout, captured to a file
-    let output = Command::new(elasticdump_binary())
-        .args(&[
+    let output = binary_command()
+        .args([
             "--input",
             &format!("{}/{}", ES_URL, test_index),
             "--output",
@@ -518,7 +551,7 @@ async fn test_pagination_and_complex_query() -> Result<()> {
         // Extract and store the ID
         let id = document["_source"]["id"].as_i64().unwrap();
         assert!(
-            id >= 20 && id <= 70,
+            (20..=70).contains(&id),
             "ID should be between 20 and 70, got {}",
             id
         );
@@ -655,8 +688,8 @@ async fn test_overwrite_flag() -> Result<()> {
 
     // Run dump without --overwrite (should fail or do nothing depending on implementation)
     // We expect our implementation with OpenOptions::create_new to fail here
-    let status = Command::new(elasticdump_binary())
-        .args(&[
+    let status = binary_command()
+        .args([
             "--input",
             &format!("{}/{}", ES_URL, test_index),
             "--output",
@@ -693,12 +726,13 @@ async fn test_overwrite_flag() -> Result<()> {
 
 #[tokio::test]
 async fn test_overwrite_preserves_existing_file_on_invalid_search_body() -> Result<()> {
-    let output_file = "test_output_invalid_search_body_preserve.jsonl";
+    let output_path = unique_output_path("invalid_search_body_preserve");
+    let output_file = output_path.to_str().unwrap();
     let original_content = "keep me intact\n";
     std::fs::write(output_file, original_content)?;
 
     let output = Command::new(elasticdump_binary())
-        .args(&[
+        .args([
             "--input",
             "http://localhost:9200/nonexistent_index",
             "--output",
@@ -1764,5 +1798,701 @@ async fn test_dump_correctness() -> Result<()> {
     // Cleanup
     cleanup(&test_index, &output_file).await?;
 
+    Ok(())
+}
+
+// ===========================================================================
+// Task 6: failure-path, empty/edge, adversarial, SIGINT, and mock-ES coverage
+//
+// Each test below guards a specific Task 1-5 behavior; the comment on each says
+// what a regression would look like (i.e. how the test fails if the guard is
+// removed). The two mock partial-response tests additionally assert
+// `request_count()` to prove the mocked code path was actually driven.
+// ===========================================================================
+
+/// A bare Elasticsearch client against the live test node.
+async fn es_client() -> Result<Elasticsearch> {
+    let url = Url::parse(ES_URL)?;
+    let conn_pool = SingleNodeConnectionPool::new(url);
+    let transport = TransportBuilder::new(conn_pool).build()?;
+    Ok(Elasticsearch::new(transport))
+}
+
+/// Create a fresh, empty index (1 shard, 0 replicas), replacing any prior one.
+async fn create_empty_index(test_index: &str) -> Result<()> {
+    wait_for_elasticsearch().await?;
+    let client = es_client().await?;
+    let _ = client
+        .indices()
+        .delete(IndicesDeleteParts::Index(&[test_index]))
+        .send()
+        .await;
+    let response = client
+        .indices()
+        .create(IndicesCreateParts::Index(test_index))
+        .body(json!({
+            "settings": { "number_of_shards": 1, "number_of_replicas": 0 }
+        }))
+        .send()
+        .await?;
+    assert!(
+        response.status_code().is_success(),
+        "Failed to create index {}: {:?}",
+        test_index,
+        response.text().await?
+    );
+    client
+        .indices()
+        .refresh(IndicesRefreshParts::Index(&[test_index]))
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Seed `num_docs` minimal documents (auto ids) into a fresh index and verify
+/// the count landed.
+async fn seed_bulk_docs(test_index: &str, num_docs: u32) -> Result<()> {
+    create_empty_index(test_index).await?;
+    let client = es_client().await?;
+    // 3 words of lipsum keeps documents tiny so large seeds stay fast.
+    insert_large_dataset_bulk(&client, test_index, 1, num_docs, 3, 1000).await?;
+    client
+        .indices()
+        .refresh(IndicesRefreshParts::Index(&[test_index]))
+        .send()
+        .await?;
+
+    let search = client
+        .search(SearchParts::Index(&[test_index]))
+        .body(json!({ "size": 0, "track_total_hits": true }))
+        .send()
+        .await?;
+    let body: Value = search.json().await?;
+    let total = body["hits"]["total"]["value"].as_u64().unwrap();
+    assert_eq!(
+        total, num_docs as u64,
+        "Expected {} seeded docs, found {}",
+        num_docs, total
+    );
+    Ok(())
+}
+
+/// Count non-EOF newline-delimited lines in an output file.
+fn count_lines(path: &str) -> Result<usize> {
+    let file = File::open(path)?;
+    Ok(BufReader::new(file).lines().count())
+}
+
+/// Collect any `.{file_name}.part-*` staging siblings left in `dir`.
+fn staging_siblings(dir: &std::path::Path, file_name: &str) -> Vec<std::path::PathBuf> {
+    let prefix = format!(".{file_name}.part-");
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(&prefix))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Run the binary to completion off the async runtime, capturing its output.
+async fn run_binary(args: Vec<String>) -> std::process::Output {
+    tokio::task::spawn_blocking(move || {
+        binary_command()
+            .args(args)
+            .output()
+            .expect("failed to spawn elasticdump-rs")
+    })
+    .await
+    .expect("subprocess task panicked")
+}
+
+/// `--limit 0` must be rejected at clap parse time; no ES interaction. Guards
+/// finding 30: a regression that dropped the `value_parser` would exit 0 here.
+#[test]
+fn test_limit_zero_is_rejected() {
+    let output = Command::new(elasticdump_binary())
+        .args([
+            "--input",
+            "http://localhost:9200/whatever",
+            "--output",
+            "$",
+            "--limit",
+            "0",
+        ])
+        .output()
+        .expect("failed to spawn elasticdump-rs");
+
+    assert!(!output.status.success(), "--limit 0 must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("greater than 0"),
+        "stderr should explain the limit must be > 0, got: {stderr}"
+    );
+}
+
+/// `--slices 1` should warn and behave exactly like an unsliced dump (ES rejects
+/// slice.max=1). A regression that passed slices=1 straight to ES would make ES
+/// return an error and the dump would exit non-zero.
+#[tokio::test]
+async fn test_slices_one_runs_unsliced() -> Result<()> {
+    for search_type in ["scroll", "pit"] {
+        let test_index = get_unique_test_index();
+        let output_path = unique_output_path(&format!("slices_one_{search_type}"));
+        let output_file = output_path.to_str().unwrap();
+
+        setup_test_data(&test_index).await?;
+
+        let output = run_elasticdump_command_capture(&[
+            "--input",
+            &format!("{}/{}", ES_URL, test_index),
+            "--output",
+            output_file,
+            "--searchType",
+            search_type,
+            "--slices",
+            "1",
+            "--quiet",
+        ])?;
+        assert!(
+            output.status.success(),
+            "--slices 1 ({search_type}) should exit 0; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            count_lines(output_file)?,
+            100,
+            "expected 100 docs with --slices 1 ({search_type})"
+        );
+
+        cleanup(&test_index, output_file).await?;
+    }
+    Ok(())
+}
+
+/// A failed dump must leave an existing destination byte-for-byte intact and
+/// leave no `.part-` staging sibling. Guards finding 32/33 (staged output): a
+/// regression that wrote in place would clobber the sentinel.
+#[tokio::test]
+async fn test_failed_dump_preserves_existing_output() -> Result<()> {
+    wait_for_elasticsearch().await?;
+
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("existing_output.jsonl");
+    let sentinel = "sentinel content that must survive\n";
+    std::fs::write(&dest, sentinel)?;
+
+    let missing_index = format!("elasticdump_rs_missing_{}", std::process::id());
+    let output = run_elasticdump_command_capture(&[
+        "--input",
+        &format!("{}/{}", ES_URL, missing_index),
+        "--output",
+        dest.to_str().unwrap(),
+        "--overwrite",
+        "--quiet",
+    ])?;
+
+    assert!(
+        !output.status.success(),
+        "dump against a missing index must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dest)?,
+        sentinel,
+        "existing destination must be untouched after a failed dump"
+    );
+    let leftovers = staging_siblings(dir.path(), "existing_output.jsonl");
+    assert!(
+        leftovers.is_empty(),
+        "no staging sibling should remain: {leftovers:?}"
+    );
+    Ok(())
+}
+
+/// A dump of an empty index succeeds and produces an empty output file (both
+/// scroll and PIT). A regression that errored on zero hits would exit non-zero.
+#[tokio::test]
+async fn test_empty_index_dump() -> Result<()> {
+    for search_type in ["scroll", "pit"] {
+        let test_index = get_unique_test_index();
+        let output_path = unique_output_path(&format!("empty_{search_type}"));
+        let output_file = output_path.to_str().unwrap();
+
+        create_empty_index(&test_index).await?;
+
+        let output = run_elasticdump_command_capture(&[
+            "--input",
+            &format!("{}/{}", ES_URL, test_index),
+            "--output",
+            output_file,
+            "--searchType",
+            search_type,
+            "--quiet",
+        ])?;
+        assert!(
+            output.status.success(),
+            "empty index dump ({search_type}) should exit 0; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::path::Path::new(output_file).exists(),
+            "output file should exist for an empty dump ({search_type})"
+        );
+        assert_eq!(
+            count_lines(output_file)?,
+            0,
+            "empty index should yield 0 lines ({search_type})"
+        );
+
+        cleanup(&test_index, output_file).await?;
+    }
+    Ok(())
+}
+
+/// A high-contention pipeline (more slices than workers, buffer size 1, small
+/// batch) must still emit every document exactly once. Guards the pipeline core
+/// (finding-set for Task 4): a lost-wakeup/backpressure regression drops docs.
+#[tokio::test]
+async fn test_backpressure_matrix() -> Result<()> {
+    for search_type in ["scroll", "pit"] {
+        let test_index = get_unique_test_index();
+        let output_path = unique_output_path(&format!("backpressure_{search_type}"));
+        let output_file = output_path.to_str().unwrap();
+
+        seed_bulk_docs(&test_index, 5_000).await?;
+
+        let output = run_elasticdump_command_capture(&[
+            "--input",
+            &format!("{}/{}", ES_URL, test_index),
+            "--output",
+            output_file,
+            "--searchType",
+            search_type,
+            "--slices",
+            "3",
+            "--workers",
+            "2",
+            "--bufferSize",
+            "1",
+            "--limit",
+            "100",
+            "--quiet",
+        ])?;
+        assert!(
+            output.status.success(),
+            "backpressure matrix ({search_type}) should exit 0; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            count_lines(output_file)?,
+            5_000,
+            "expected exactly 5000 docs ({search_type})"
+        );
+
+        cleanup(&test_index, output_file).await?;
+    }
+    Ok(())
+}
+
+/// With progress bars ENABLED (no --quiet) and `--output $`, stdout must be pure
+/// JSONL and all progress noise must stay on stderr. Guards finding 31: a
+/// regression that drew progress to stdout would break the JSON parse below.
+#[tokio::test]
+async fn test_stdout_is_pure_jsonl_with_progress_enabled() -> Result<()> {
+    let test_index = get_unique_test_index();
+    seed_bulk_docs(&test_index, 50).await?;
+
+    // Deliberately omit --quiet so progress bars are active.
+    let output = run_elasticdump_command_capture(&[
+        "--input",
+        &format!("{}/{}", ES_URL, test_index),
+        "--output",
+        "$",
+    ])?;
+    assert!(
+        output.status.success(),
+        "dump should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut line_count = 0;
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let doc: Value = serde_json::from_str(line)
+            .map_err(|e| anyhow::anyhow!("stdout line is not valid JSON: {line:?}: {e}"))?;
+        assert!(
+            doc["_source"].get("id").is_some(),
+            "each stdout doc should carry _source.id, got: {line}"
+        );
+        line_count += 1;
+    }
+    assert_eq!(line_count, 50, "expected exactly 50 JSON lines on stdout");
+
+    cleanup(&test_index, "").await?;
+    Ok(())
+}
+
+/// Documents whose `_source` carries unicode, JSON escapes, and keys that
+/// collide with the extractor's metadata pointers must round-trip byte-exactly
+/// (both scroll and PIT). Guards the streaming extractor (Task 2/perf fuse): a
+/// regression that mis-parsed raw hit bytes would corrupt these sources.
+#[tokio::test]
+async fn test_adversarial_documents_roundtrip() -> Result<()> {
+    // Values are nested under a mapping-disabled `payload` object so ES stores
+    // _source verbatim without dynamic-mapping conflicts (mixed-type arrays,
+    // underscore-prefixed keys). The extractor still sees the tricky raw bytes.
+    let payloads: Vec<(String, Value)> = vec![
+        (
+            "adv-1".to_string(),
+            json!({
+                "text": "quote\" backslash\\ newline\n tab\t end",
+                "unicode": "é中文😀🚀 Ω≈ç√",
+                "hits": { "nested": true, "list": [1, 2, 3] },
+                "sort": ["a", "b", "c"],
+                "pit_id": ["decoy", "array"],
+                "_scroll_id": "decoy-scroll"
+            }),
+        ),
+        (
+            "adv-2".to_string(),
+            json!({
+                "raw": "中文😀",
+                "message": "line1\nline2 with \"quotes\" and \\slash",
+                "hits": { "deep": { "deeper": "值" } },
+                "empty_obj": {},
+                "empty_arr": []
+            }),
+        ),
+    ];
+
+    for search_type in ["scroll", "pit"] {
+        let test_index = get_unique_test_index();
+        let output_path = unique_output_path(&format!("adversarial_{search_type}"));
+        let output_file = output_path.to_str().unwrap();
+
+        wait_for_elasticsearch().await?;
+        let client = es_client().await?;
+        let _ = client
+            .indices()
+            .delete(IndicesDeleteParts::Index(&[test_index.as_str()]))
+            .send()
+            .await;
+        let create = client
+            .indices()
+            .create(IndicesCreateParts::Index(&test_index))
+            .body(json!({
+                "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+                "mappings": { "properties": { "payload": { "type": "object", "enabled": false } } }
+            }))
+            .send()
+            .await?;
+        assert!(
+            create.status_code().is_success(),
+            "create adversarial index failed: {:?}",
+            create.text().await?
+        );
+
+        let mut expected: HashMap<String, Value> = HashMap::new();
+        for (id, payload) in &payloads {
+            let source = json!({ "payload": payload.clone() });
+            let resp = client
+                .index(elasticsearch::IndexParts::IndexId(&test_index, id))
+                .body(source.clone())
+                .send()
+                .await?;
+            assert!(
+                resp.status_code().is_success(),
+                "index {id} failed: {:?}",
+                resp.text().await?
+            );
+            expected.insert(id.clone(), source);
+        }
+        client
+            .indices()
+            .refresh(IndicesRefreshParts::Index(&[test_index.as_str()]))
+            .send()
+            .await?;
+
+        let output = run_elasticdump_command_capture(&[
+            "--input",
+            &format!("{}/{}", ES_URL, test_index),
+            "--output",
+            output_file,
+            "--searchType",
+            search_type,
+            "--quiet",
+        ])?;
+        assert!(
+            output.status.success(),
+            "adversarial dump ({search_type}) should exit 0; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let file = File::open(output_file)?;
+        let mut dumped: HashMap<String, Value> = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let doc: Value = serde_json::from_str(&line)?;
+            let id = doc["_id"].as_str().unwrap().to_string();
+            dumped.insert(id, doc["_source"].clone());
+        }
+
+        assert_eq!(
+            dumped.len(),
+            expected.len(),
+            "doc count mismatch ({search_type})"
+        );
+        for (id, source) in &expected {
+            let got = dumped
+                .get(id)
+                .unwrap_or_else(|| panic!("missing dumped doc {id} ({search_type})"));
+            assert_eq!(got, source, "_source mismatch for {id} ({search_type})");
+        }
+
+        cleanup(&test_index, output_file).await?;
+    }
+    Ok(())
+}
+
+/// SIGINT during a running dump must cancel it, remove the staging file, exit
+/// non-zero, and never create the destination. Guards Task 5 signal handling.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_sigint_cleans_up_staging() -> Result<()> {
+    let test_index = get_unique_test_index();
+    // 20k docs at --limit 200 means ~100 sequential scroll round-trips: long
+    // enough that the process is reliably mid-dump when we signal it.
+    seed_bulk_docs(&test_index, 20_000).await?;
+
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("sigint_output.jsonl");
+    let dest_str = dest.to_str().unwrap().to_string();
+
+    let mut child = binary_command()
+        .args([
+            "--input",
+            &format!("{}/{}", ES_URL, test_index),
+            "--output",
+            &dest_str,
+            "--limit",
+            "200",
+            "--quiet",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    // The staging file is created before the first ES request; poll for it with
+    // a bound so a never-starting dump fails instead of hanging.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut staging_seen = false;
+    loop {
+        if !staging_siblings(dir.path(), "sigint_output.jsonl").is_empty() {
+            staging_seen = true;
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            panic!("dump exited early (status {status:?}) before staging appeared");
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(staging_seen, "staging .part- file never appeared");
+
+    let pid = child.id();
+    let kill_status = Command::new("kill")
+        .arg("-INT")
+        .arg(pid.to_string())
+        .status()?;
+    assert!(kill_status.success(), "kill -INT failed");
+
+    let exit_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            panic!("dump did not exit within 30s after SIGINT");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert!(
+        !exit_status.success(),
+        "an interrupted dump must exit non-zero"
+    );
+    assert!(
+        staging_siblings(dir.path(), "sigint_output.jsonl").is_empty(),
+        "staging file must be cleaned up after interrupt"
+    );
+    assert!(
+        !dest.exists(),
+        "destination must not exist after an interrupted dump"
+    );
+
+    let _ = es_client()
+        .await?
+        .indices()
+        .delete(IndicesDeleteParts::Index(&[test_index.as_str()]))
+        .send()
+        .await;
+    Ok(())
+}
+
+/// Mock ES: a 200 response reporting a failed shard must fail the dump. Before
+/// Task 2 any 200 was treated as a complete batch, so this would have exited 0
+/// while silently dropping the failed shard's documents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shard_failure_fails_dump() -> Result<()> {
+    let mock = MockEs::serve(vec![CannedResponse::ok(
+        r#"{"_scroll_id":"s1","_shards":{"total":2,"successful":1,"skipped":0,"failed":1},"hits":{"total":{"value":10,"relation":"eq"},"hits":[{"_id":"1","_source":{"a":1}}]}}"#,
+    )])
+    .await;
+
+    let output = run_binary(vec![
+        "--input".into(),
+        mock.input_url("idx"),
+        "--output".into(),
+        "$".into(),
+        "--quiet".into(),
+    ])
+    .await;
+
+    assert!(
+        !output.status.success(),
+        "a failed-shard response must fail the dump"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed shard"),
+        "stderr should mention failed shard(s), got: {stderr}"
+    );
+    // Prove the initial search actually reached the mock (drives the code path).
+    assert!(
+        mock.request_count() >= 1,
+        "mock should have served the initial search, got {}",
+        mock.request_count()
+    );
+    Ok(())
+}
+
+/// Mock ES: a 200 response with timed_out=true must fail the dump. Before Task 2
+/// this partial result would have been accepted as complete (exit 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_timed_out_fails_dump() -> Result<()> {
+    let mock = MockEs::serve(vec![CannedResponse::ok(
+        r#"{"_scroll_id":"s1","timed_out":true,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":10,"relation":"eq"},"hits":[{"_id":"1","_source":{"a":1}}]}}"#,
+    )])
+    .await;
+
+    let output = run_binary(vec![
+        "--input".into(),
+        mock.input_url("idx"),
+        "--output".into(),
+        "$".into(),
+        "--quiet".into(),
+    ])
+    .await;
+
+    assert!(
+        !output.status.success(),
+        "a timed_out response must fail the dump"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timed_out"),
+        "stderr should mention timed_out, got: {stderr}"
+    );
+    assert!(
+        mock.request_count() >= 1,
+        "mock should have served the initial search, got {}",
+        mock.request_count()
+    );
+    Ok(())
+}
+
+/// Mock ES: the idempotent initial search retries a 429 and recovers. Guards the
+/// retry policy (Task 5). A regression that stopped retrying idempotent 429s
+/// would exit non-zero on the first response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_retry_recovers_from_429() -> Result<()> {
+    let mock = MockEs::serve(vec![
+        CannedResponse::new(429, r#"{"error":"rate limited"}"#),
+        CannedResponse::ok(
+            r#"{"_scroll_id":"s1","timed_out":false,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0},"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}"#,
+        ),
+        // clear_scroll issued at slice end for the returned scroll id.
+        CannedResponse::ok(r#"{"succeeded":true,"num_freed":1}"#),
+    ])
+    .await;
+
+    let output = run_binary(vec![
+        "--input".into(),
+        mock.input_url("idx"),
+        "--output".into(),
+        "$".into(),
+        "--retryDelay".into(),
+        "10".into(),
+        "--quiet".into(),
+    ])
+    .await;
+
+    assert!(
+        output.status.success(),
+        "429 then a good empty response should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        mock.request_count() >= 2,
+        "retry should have issued at least a second request, got {}",
+        mock.request_count()
+    );
+    Ok(())
+}
+
+/// Mock ES: with --retryAttempts 0 the first 429 is fatal and no retry is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_retry_attempts_zero_disables_retry() -> Result<()> {
+    let mock = MockEs::serve(vec![CannedResponse::new(
+        429,
+        r#"{"error":"rate limited"}"#,
+    )])
+    .await;
+
+    let output = run_binary(vec![
+        "--input".into(),
+        mock.input_url("idx"),
+        "--output".into(),
+        "$".into(),
+        "--retryAttempts".into(),
+        "0".into(),
+        "--quiet".into(),
+    ])
+    .await;
+
+    assert!(
+        !output.status.success(),
+        "retryAttempts=0 must not retry a 429"
+    );
+    assert_eq!(
+        mock.request_count(),
+        1,
+        "exactly one request should have been made, got {}",
+        mock.request_count()
+    );
     Ok(())
 }
