@@ -9,6 +9,12 @@ set -euo pipefail
 # Docker note: local benchmark quality depends on filesystem cache. If you use
 # this repo's docker-compose.yaml, recreate the Elasticsearch container after
 # compose memory changes so the heap/cache balance matches the benchmark intent.
+#
+# CPU-core limiting: --cpu-cores N pins each timed tool run to the first N
+# cores via taskset on Linux. macOS has no core pinning, so there N is
+# enforced as an aggregate N*100% duty-cycle cap via cpulimit (brew install
+# cpulimit); macOS wall-clock numbers under this option are indicative, not
+# authoritative.
 
 ES_URL="${ES_URL:-http://localhost:9200}"
 BENCH_DOCS="${BENCH_DOCS:-1000000}"
@@ -1327,6 +1333,12 @@ main() {
   printf '  BENCH_SEARCH_TYPES=%s\n' "${BENCH_SEARCH_TYPES}"
   printf '  BENCH_SCROLL_TIME=%s\n' "${BENCH_SCROLL_TIME}"
   printf '  BENCH_PIT_KEEP_ALIVE=%s\n' "${BENCH_PIT_KEEP_ALIVE}"
+  if [[ -n "${BENCH_CPU_CORES}" ]]; then
+    printf '  BENCH_CPU_CORES=%s\n' "${BENCH_CPU_CORES}"
+    printf '  CPU_LIMIT_WRAPPER=%s\n' "${CPU_LIMIT_WRAPPER[*]}"
+  else
+    printf '  BENCH_CPU_CORES=(unlimited)\n'
+  fi
   printf '  BENCH_INDEX=%s\n' "${BENCH_INDEX}"
   printf '  WORKDIR=%s\n' "${WORKDIR}"
 
