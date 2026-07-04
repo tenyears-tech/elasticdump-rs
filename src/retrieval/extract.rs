@@ -34,6 +34,8 @@ struct MetadataValues {
     total_value: Option<u64>,
     next_pit_id: Option<String>,
     next_scroll_id: Option<String>,
+    shards_failed: Option<u64>,
+    timed_out: Option<bool>,
 }
 
 struct MetadataInputs<'a> {
@@ -51,6 +53,10 @@ fn metadata_tree() -> &'static PointerTree {
         tree.add_path(&["hits", "total", "value"]);
         tree.add_path(&["hits", "total", "relation"]);
         tree.add_path(&pointer!["hits", "hits"]);
+        // Added AFTER the five above so the existing reverse-add pops stay valid;
+        // these two are popped FIRST in extract_metadata_inputs (see the pop order there).
+        tree.add_path(&["_shards", "failed"]);
+        tree.add_path(&["timed_out"]);
         tree
     })
 }
@@ -99,6 +105,12 @@ fn count_hits_and_last_sort_raw<'a>(
 
 fn extract_metadata_inputs(response_bytes: &Bytes) -> Result<MetadataInputs<'_>> {
     let mut values = get_many(response_bytes, metadata_tree())?;
+    // INVARIANT: get_many yields values in metadata_tree()'s add order, and pop()
+    // returns them in reverse. metadata_tree() adds, in order: _scroll_id, pit_id,
+    // hits.total.value, hits.total.relation, hits.hits, _shards.failed, timed_out.
+    // So these pops MUST stay in this exact (reverse) order and adjacent.
+    let timed_out = values.pop().flatten().and_then(|value| value.as_bool());
+    let shards_failed = values.pop().flatten().and_then(|value| value.as_u64());
     let hits = require_hits_array(values.pop().flatten())?;
     let relation = values
         .pop()
@@ -120,6 +132,8 @@ fn extract_metadata_inputs(response_bytes: &Bytes) -> Result<MetadataInputs<'_>>
             total_value,
             next_pit_id,
             next_scroll_id,
+            shards_failed,
+            timed_out,
         },
         hits,
     })
@@ -134,6 +148,20 @@ fn finalize_metadata(
     if matches!(search_type, SearchType::PointInTime) && doc_count > 0 && last_sort_raw.is_none() {
         return Err(anyhow!(
             "PIT response contains hits but the final hit is missing a usable sort value"
+        ));
+    }
+
+    // Partial responses must NEVER be treated as a complete batch: a timed-out or
+    // failed-shard response silently drops documents. Absent fields (None) are fine
+    // (not every response carries them) — only positive signals reject the batch.
+    if values.timed_out == Some(true) {
+        return Err(anyhow!(
+            "Elasticsearch response reports timed_out=true; refusing partial results (raise --requestTimeout / cluster timeouts and retry)"
+        ));
+    }
+    if let Some(failed) = values.shards_failed.filter(|f| *f > 0) {
+        return Err(anyhow!(
+            "Elasticsearch response reports {failed} failed shard(s); refusing a partial dump (check cluster health and retry)"
         ));
     }
 
@@ -152,7 +180,7 @@ fn finalize_metadata(
         },
         (None, _) => TotalHitsEstimate {
             value: doc_count,
-            is_exact: true,
+            is_exact: false,
         },
     };
 
@@ -164,27 +192,6 @@ fn finalize_metadata(
         doc_count,
         hits_are_empty: doc_count == 0,
     })
-}
-
-fn build_output_batch_from_hits(
-    hits: LazyValue<'_>,
-    response_bytes_len: usize,
-) -> Result<ExtractedOutputBatch> {
-    let iter = hits
-        .into_array_iter()
-        .ok_or_else(|| anyhow!("Elasticsearch response field hits.hits is not iterable"))?;
-
-    let mut buffer = Vec::with_capacity(response_bytes_len);
-    let mut doc_count = 0u64;
-
-    for hit in iter {
-        let hit = hit?;
-        buffer.extend_from_slice(hit.as_raw_str().as_bytes());
-        buffer.push(b'\n');
-        doc_count += 1;
-    }
-
-    Ok(ExtractedOutputBatch { buffer, doc_count })
 }
 
 pub(crate) fn extract_batch_metadata(
@@ -242,22 +249,10 @@ pub(crate) fn extract_batch(
     })
 }
 
-pub(crate) fn build_output_batch(response_bytes: &Bytes) -> Result<ExtractedOutputBatch> {
-    let hits = sonic_rs::get(response_bytes, &["hits", "hits"]).map_err(|error| {
-        anyhow!(
-            "Failed to locate hits.hits for output extraction: {}",
-            error
-        )
-    })?;
-
-    build_output_batch_from_hits(hits, response_bytes.len())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        build_output_batch, count_hits_and_last_sort_raw, extract_batch, extract_batch_metadata,
-        require_hits_array,
+        count_hits_and_last_sort_raw, extract_batch, extract_batch_metadata, require_hits_array,
     };
     use crate::cli::SearchType;
     use bytes::Bytes;
@@ -380,60 +375,8 @@ mod tests {
         let metadata = extract_batch_metadata(&response, &SearchType::Scroll).unwrap();
 
         assert_eq!(metadata.total_hits.value, 3);
-        assert!(metadata.total_hits.is_exact);
+        assert!(!metadata.total_hits.is_exact);
         assert_eq!(metadata.doc_count, 3);
-    }
-
-    #[test]
-    fn build_output_batch_preserves_original_hit_json() {
-        let response = Bytes::from_static(
-            br#"{
-                "_scroll_id":"scroll-123",
-                "hits":{
-                    "total":{"value":2,"relation":"eq"},
-                    "hits":[
-                        {"_id":"1","_source":{"name":"a","nested":{"x":1}}},
-                        {"_id":"2","_source":{"name":"b","tags":["t1","t2"]}}
-                    ]
-                }
-            }"#,
-        );
-
-        let batch = build_output_batch(&response).unwrap();
-        let output = String::from_utf8(batch.buffer).unwrap();
-
-        assert_eq!(batch.doc_count, 2);
-        assert!(output.contains(r#"{"_id":"1","_source":{"name":"a","nested":{"x":1}}}"#));
-        assert!(output.contains(r#"{"_id":"2","_source":{"name":"b","tags":["t1","t2"]}}"#));
-        assert_eq!(output.lines().count(), 2);
-    }
-
-    #[test]
-    fn build_output_batch_preserves_original_hit_json_for_pit_response() {
-        let response = Bytes::from_static(
-            br#"{
-                "pit_id":"pit-next",
-                "hits":{
-                    "total":{"value":2,"relation":"eq"},
-                    "hits":[
-                        {"_id":"1","sort":[1,"a"],"_source":{"name":"a","nested":{"x":1}}},
-                        {"_id":"2","sort":[2,{"nested":true}],"_source":{"name":"b","tags":["t1","t2"]}}
-                    ]
-                }
-            }"#,
-        );
-
-        let batch = build_output_batch(&response).unwrap();
-        let output = String::from_utf8(batch.buffer).unwrap();
-
-        assert_eq!(batch.doc_count, 2);
-        assert!(output.contains(
-            r#"{"_id":"1","sort":[1,"a"],"_source":{"name":"a","nested":{"x":1}}}"#
-        ));
-        assert!(output.contains(
-            r#"{"_id":"2","sort":[2,{"nested":true}],"_source":{"name":"b","tags":["t1","t2"]}}"#
-        ));
-        assert_eq!(output.lines().count(), 2);
     }
 
     #[test]
@@ -513,5 +456,85 @@ mod tests {
             .to_string();
 
         assert!(error.contains("hits.hits"));
+    }
+
+    #[test]
+    fn extract_batch_metadata_rejects_failed_shards() {
+        let response = Bytes::from_static(
+            br#"{"_scroll_id":"s","_shards":{"total":5,"successful":4,"skipped":0,"failed":1},"hits":{"total":{"value":10,"relation":"eq"},"hits":[{"_id":"1","_source":{}}]}}"#,
+        );
+        let error = extract_batch_metadata(&response, &SearchType::Scroll)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 failed shard"));
+    }
+
+    #[test]
+    fn extract_batch_metadata_rejects_timed_out_responses() {
+        let response = Bytes::from_static(
+            br#"{"_scroll_id":"s","timed_out":true,"_shards":{"total":5,"successful":5,"skipped":0,"failed":0},"hits":{"total":{"value":10,"relation":"eq"},"hits":[{"_id":"1","_source":{}}]}}"#,
+        );
+        let error = extract_batch_metadata(&response, &SearchType::Scroll)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed_out"));
+    }
+
+    #[test]
+    fn extract_batch_metadata_accepts_zero_failed_shards() {
+        let response = Bytes::from_static(
+            br#"{"_scroll_id":"s","timed_out":false,"_shards":{"total":5,"successful":5,"skipped":0,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"1","_source":{}}]}}"#,
+        );
+
+        let metadata = extract_batch_metadata(&response, &SearchType::Scroll).unwrap();
+
+        assert_eq!(metadata.next_scroll_id.as_deref(), Some("s"));
+        assert_eq!(metadata.doc_count, 1);
+        assert!(!metadata.hits_are_empty);
+    }
+
+    #[test]
+    fn extract_batch_preserves_bytes_with_escapes_and_unicode() {
+        // Adversarial hits: JSON escapes (quote/backslash/slash), non-ASCII + emoji,
+        // raw UTF-8, and _source keys colliding with metadata pointers
+        // ("hits", "sort", "_scroll_id", "pit_id") carrying object/array values.
+        let hit1 = r#"{"_id":"1","_source":{"text":"quote\"backslash\\slash\/","unicode":"é中😀","hits":{"nested":true},"sort":[1,"a"]}}"#;
+        let hit2 = r#"{"_id":"2","_source":{"raw":"中文😀","_scroll_id":"decoy-scroll","pit_id":["decoy","array"]}}"#;
+        let response_str = format!(
+            r#"{{"_scroll_id":"real-scroll","hits":{{"total":{{"value":2,"relation":"eq"}},"hits":[{hit1},{hit2}]}}}}"#
+        );
+        let response = Bytes::from(response_str.into_bytes());
+
+        let extracted = extract_batch(&response, &SearchType::Scroll).unwrap();
+
+        // The top-level pointers must win over the colliding _source keys.
+        assert_eq!(
+            extracted.metadata.next_scroll_id.as_deref(),
+            Some("real-scroll")
+        );
+        assert!(extracted.metadata.next_pit_id.is_none());
+
+        // Byte-identical output: exact raw hit bytes joined by '\n', not a `contains` check.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(hit1.as_bytes());
+        expected.push(b'\n');
+        expected.extend_from_slice(hit2.as_bytes());
+        expected.push(b'\n');
+        assert_eq!(extracted.output.buffer, expected);
+        assert_eq!(extracted.output.doc_count, 2);
+    }
+
+    #[test]
+    fn extract_batch_handles_empty_hits_array() {
+        let response = Bytes::from_static(
+            br#"{"_scroll_id":"scroll-empty","hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}"#,
+        );
+
+        let extracted = extract_batch(&response, &SearchType::Scroll).unwrap();
+
+        assert_eq!(extracted.metadata.doc_count, 0);
+        assert!(extracted.metadata.hits_are_empty);
+        assert!(extracted.output.buffer.is_empty());
+        assert_eq!(extracted.output.doc_count, 0);
     }
 }
