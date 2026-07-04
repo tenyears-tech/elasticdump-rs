@@ -783,6 +783,9 @@ resolve_cpu_limit_wrapper() {
     CPU_LIMIT_WRAPPER=(cpulimit "--limit=$((BENCH_CPU_CORES * 100))" --include-children --)
     log "macOS CPU limit uses cpulimit duty-cycling (aggregate ${BENCH_CPU_CORES}00% cap, not core pinning); wall-clock results are indicative"
   fi
+
+  "${CPU_LIMIT_WRAPPER[@]}" true >/dev/null 2>&1 \
+    || die "CPU limit wrapper failed self-test: ${CPU_LIMIT_WRAPPER[*]}"
 }
 
 count_file_lines() {
