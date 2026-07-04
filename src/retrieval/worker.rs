@@ -494,7 +494,7 @@ mod tests {
 
         let metadata = reply_rx.await.unwrap().unwrap();
         assert_eq!(metadata.next_scroll_id.as_deref(), Some("scroll-next"));
-        assert!(metadata.hits_are_empty == false);
+        assert!(!metadata.hits_are_empty);
         assert_eq!(metadata.doc_count, 1);
 
         let batch = processed_rx.recv().await.unwrap();

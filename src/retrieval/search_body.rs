@@ -11,8 +11,7 @@ use crate::cli::Cli;
 /// Prepare search body JSON from CLI arguments
 pub async fn prepare_search_body(args: &Cli) -> Result<Value> {
     let search_body_json = if let Some(search_body_str) = &args.search_body {
-        if search_body_str.starts_with('@') {
-            let file_path = &search_body_str[1..];
+        if let Some(file_path) = search_body_str.strip_prefix('@') {
             debug!("Loading search body from file: {}", file_path);
             let content = fs::read_to_string(file_path)
                 .await
