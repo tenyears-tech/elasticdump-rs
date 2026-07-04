@@ -2140,6 +2140,70 @@ async fn test_stdout_is_pure_jsonl_with_progress_enabled() -> Result<()> {
     Ok(())
 }
 
+/// Dropping the stdout reader mid-dump (what `| head` does) must let the binary
+/// exit 0 rather than die on the resulting broken pipe. Guards the OutputClosed
+/// exit-0 path: a regression that propagated the broken-pipe error to the exit
+/// code would fail here with a non-zero status.
+#[tokio::test]
+async fn test_stdout_broken_pipe_exits_zero() -> Result<()> {
+    let test_index = get_unique_test_index();
+    // A few thousand docs at --limit 100 keep the binary streaming well past the
+    // point the OS pipe buffer fills, so it is still writing when we close the
+    // reader (rather than having buffered the whole dump and exited already).
+    seed_bulk_docs(&test_index, 5_000).await?;
+
+    let mut child = binary_command()
+        .args([
+            "--input",
+            &format!("{}/{}", ES_URL, test_index),
+            "--output",
+            "$",
+            "--quiet",
+            "--limit",
+            "100",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    // Read a handful of lines, then drop the stdout handle to close the read end
+    // of the pipe. The binary's next write should observe a broken pipe.
+    {
+        let stdout = child.stdout.take().expect("child stdout must be piped");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        for _ in 0..5 {
+            line.clear();
+            // A short read is fine; we only need to prove the stream started.
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+        }
+        // `reader` (and its underlying stdout handle) drop here, closing the pipe.
+    }
+
+    // Poll for exit with a generous bound; loud-fail if the dump hangs instead
+    // of noticing the closed reader.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("dump did not exit within 30s after the stdout reader closed");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert!(
+        exit_status.success(),
+        "closing the stdout reader early must exit 0, got {exit_status:?}"
+    );
+
+    cleanup(&test_index, "").await?;
+    Ok(())
+}
+
 /// Documents whose `_source` carries unicode, JSON escapes, and keys that
 /// collide with the extractor's metadata pointers must round-trip byte-exactly
 /// (both scroll and PIT). Guards the streaming extractor (Task 2/perf fuse): a
