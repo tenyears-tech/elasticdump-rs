@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use elasticsearch::SearchParts;
 use log::{debug, info};
 use sonic_rs::{JsonValueMutTrait, JsonValueTrait, Value, json};
@@ -8,10 +8,10 @@ use crate::cli::SearchType;
 use super::{
     context::RetrievalContext,
     extract::BatchMetadata,
-    pit::SharedPitCoordinator,
+    pit::{PitAbortGuard, SharedPitCoordinator},
     retrieval_task::{
-        TotalHitsEstimate, abort_shared_pit, ensure_pit_sort, process_response_batch,
-        read_checked_response_bytes, record_total_hits,
+        DumpCancelled, RetryMode, TotalHitsEstimate, abort_shared_pit, ensure_pit_sort,
+        process_response_batch, record_total_hits, send_checked_with_retry,
     },
     slice_state::SliceState,
 };
@@ -87,10 +87,18 @@ pub(crate) async fn run_pit_slice(
     shared_pit: Option<SharedPitCoordinator>,
 ) -> Result<TotalHitsEstimate> {
     let shared_pit = shared_pit.expect("PIT mode requires shared coordinator");
+    // If this slice unwinds without defusing (panic or error return), the
+    // guard aborts the coordinator so siblings parked in wait_for_generation
+    // are released instead of waiting forever.
+    let abort_guard = PitAbortGuard::new(shared_pit.clone());
     ensure_pit_sort(&mut state.search_body);
     let batch_size = pit_batch_size(&state.search_body);
 
-    let lease = shared_pit.acquire().await;
+    if ctx.cancel.is_cancelled() {
+        return Err(anyhow::Error::new(DumpCancelled));
+    }
+
+    let lease = shared_pit.acquire();
     state.pit_generation = Some(lease.generation);
 
     let mut request_body =
@@ -100,40 +108,30 @@ pub(crate) async fn run_pit_slice(
         sonic_rs::to_string(&request_body).unwrap_or_default()
     );
 
-    let response = match ctx
-        .client
-        .search(SearchParts::None)
-        .allow_partial_search_results(false)
-        .body(&request_body)
-        .send()
-        .await
+    // PIT search_after requests are idempotent (the cursor lives in the
+    // request, not on the server), so full retries are safe.
+    let response_bytes = match send_checked_with_retry(
+        ctx.retry,
+        &ctx.cancel,
+        RetryMode::Idempotent,
+        state.slice_id,
+        "initial search",
+        || {
+            ctx.client
+                .search(SearchParts::None)
+                .allow_partial_search_results(false)
+                .body(&request_body)
+                .send()
+        },
+    )
+    .await
     {
-        Ok(response) => {
-            debug!(
-                "Slice {}: Initial search request successful",
-                state.slice_id
-            );
-            response
-        }
+        Ok(bytes) => bytes,
         Err(error) => {
-            let search_error = anyhow!(
-                "Slice {}: Failed to initiate search: {} - this might indicate connection issues or invalid credentials",
-                state.slice_id,
-                error
-            );
-            abort_shared_pit(&Some(shared_pit.clone()), &search_error).await;
-            return Err(search_error);
+            abort_shared_pit(&Some(shared_pit.clone()), &error);
+            return Err(error);
         }
     };
-
-    let response_bytes =
-        match read_checked_response_bytes(response, state.slice_id, "initial search").await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                abort_shared_pit(&Some(shared_pit.clone()), &error).await;
-                return Err(error);
-            }
-        };
     let initial_bytes = response_bytes.len() as u64;
     debug!(
         "Slice {}: Read {} bytes for initial response",
@@ -153,12 +151,10 @@ pub(crate) async fn run_pit_slice(
         Err(error) => {
             if let Some(metadata) = error.metadata() {
                 apply_pit_batch_metadata(state, metadata);
-                shared_pit
-                    .observe_returned_id(state.current_id.as_deref())
-                    .await;
+                shared_pit.observe_returned_id(state.current_id.as_deref());
             }
             let error = error.into_error();
-            abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+            abort_shared_pit(&Some(shared_pit.clone()), &error);
             return Err(error);
         }
     };
@@ -170,21 +166,16 @@ pub(crate) async fn run_pit_slice(
     );
 
     apply_pit_batch_metadata(state, &metadata);
-    shared_pit
-        .observe_returned_id(state.current_id.as_deref())
-        .await;
+    shared_pit.observe_returned_id(state.current_id.as_deref());
 
     let initial_slice_finished = pit_slice_finished(&metadata, batch_size);
 
-    if let Err(error) = shared_pit
-        .complete_round(
-            state.pit_generation.expect("PIT generation should be set"),
-            state.current_id.clone(),
-            initial_slice_finished,
-        )
-        .await
-    {
-        abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+    if let Err(error) = shared_pit.complete_round(
+        state.pit_generation.expect("PIT generation should be set"),
+        state.current_id.clone(),
+        initial_slice_finished,
+    ) {
+        abort_shared_pit(&Some(shared_pit.clone()), &error);
         return Err(error);
     }
 
@@ -197,6 +188,7 @@ pub(crate) async fn run_pit_slice(
             "Slice {} completed, retrieved {} documents",
             state.slice_id, state.retrieved_hits
         );
+        abort_guard.defuse();
         return Ok(slice_total_hits);
     }
 
@@ -213,6 +205,10 @@ pub(crate) async fn run_pit_slice(
     };
 
     loop {
+        if ctx.cancel.is_cancelled() {
+            return Err(anyhow::Error::new(DumpCancelled));
+        }
+
         debug!("Slice {}: Fetching next batch", state.slice_id);
         if let Err(error) = update_pit_search_body(
             &mut request_body,
@@ -220,7 +216,7 @@ pub(crate) async fn run_pit_slice(
             pit_keep_alive,
             state.search_after.as_deref(),
         ) {
-            abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+            abort_shared_pit(&Some(shared_pit.clone()), &error);
             return Err(error);
         }
         debug!(
@@ -228,39 +224,28 @@ pub(crate) async fn run_pit_slice(
             sonic_rs::to_string(&request_body).unwrap_or_default()
         );
 
-        let next_response = match ctx
-            .client
-            .search(SearchParts::None)
-            .allow_partial_search_results(false)
-            .body(&request_body)
-            .send()
-            .await
+        let next_response_bytes = match send_checked_with_retry(
+            ctx.retry,
+            &ctx.cancel,
+            RetryMode::Idempotent,
+            state.slice_id,
+            "continuation search",
+            || {
+                ctx.client
+                    .search(SearchParts::None)
+                    .allow_partial_search_results(false)
+                    .body(&request_body)
+                    .send()
+            },
+        )
+        .await
         {
-            Ok(response) => {
-                debug!("Slice {}: Next batch request successful", state.slice_id);
-                response
-            }
+            Ok(bytes) => bytes,
             Err(error) => {
-                let search_error = anyhow!(
-                    "Slice {}: Search continuation error: {}",
-                    state.slice_id,
-                    error
-                );
-                abort_shared_pit(&Some(shared_pit.clone()), &search_error).await;
-                return Err(search_error);
+                abort_shared_pit(&Some(shared_pit.clone()), &error);
+                return Err(error);
             }
         };
-
-        let next_response_bytes =
-            match read_checked_response_bytes(next_response, state.slice_id, "continuation search")
-                .await
-            {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    abort_shared_pit(&Some(shared_pit.clone()), &error).await;
-                    return Err(error);
-                }
-            };
 
         let batch_bytes = next_response_bytes.len() as u64;
         debug!(
@@ -281,12 +266,10 @@ pub(crate) async fn run_pit_slice(
             Err(error) => {
                 if let Some(metadata) = error.metadata() {
                     apply_pit_batch_metadata(state, metadata);
-                    shared_pit
-                        .observe_returned_id(state.current_id.as_deref())
-                        .await;
+                    shared_pit.observe_returned_id(state.current_id.as_deref());
                 }
                 let error = error.into_error();
-                abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+                abort_shared_pit(&Some(shared_pit.clone()), &error);
                 return Err(error);
             }
         };
@@ -297,21 +280,16 @@ pub(crate) async fn run_pit_slice(
         );
 
         apply_pit_batch_metadata(state, &metadata);
-        shared_pit
-            .observe_returned_id(state.current_id.as_deref())
-            .await;
+        shared_pit.observe_returned_id(state.current_id.as_deref());
 
         let slice_finished = pit_slice_finished(&metadata, batch_size);
 
-        if let Err(error) = shared_pit
-            .complete_round(
-                state.pit_generation.expect("PIT generation should be set"),
-                state.current_id.clone(),
-                slice_finished,
-            )
-            .await
-        {
-            abort_shared_pit(&Some(shared_pit.clone()), &error).await;
+        if let Err(error) = shared_pit.complete_round(
+            state.pit_generation.expect("PIT generation should be set"),
+            state.current_id.clone(),
+            slice_finished,
+        ) {
+            abort_shared_pit(&Some(shared_pit.clone()), &error);
             return Err(error);
         }
 
@@ -341,6 +319,7 @@ pub(crate) async fn run_pit_slice(
         state.slice_id, state.retrieved_hits
     );
 
+    abort_guard.defuse();
     Ok(slice_total_hits)
 }
 

@@ -18,11 +18,12 @@ use log::{debug, info};
 use sonic_rs::{JsonValueMutTrait, json};
 use std::future::Future;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::cli::{Cli, SearchType};
 
@@ -30,7 +31,27 @@ use self::context::RetrievalContext;
 use self::messages::RetrievalMessage;
 use self::pit::SharedPitCoordinator;
 use self::progress::setup_progress_bars;
+use self::retrieval_task::{RetryPolicy, is_cancelled};
 use self::slice_state::SliceState;
+
+/// Why the pipeline token was cancelled. `Interrupt` (Ctrl+C) makes the dump
+/// fail after cleanup; `OutputClosed` (stdout reader went away) makes the
+/// cancellation cascade count as an early, successful stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReason {
+    Interrupt,
+    OutputClosed,
+}
+
+/// Aborts the wrapped task when dropped, so the Ctrl+C listener dies with
+/// `dump_data` on every return path instead of leaking.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 async fn create_output_target_and_shared_pit<
     O,
@@ -73,8 +94,9 @@ where
 
 /// Pick the pipeline's root-cause error. The output task's error (e.g. disk
 /// full) outranks retrieval errors, which outrank worker errors: the latter
-/// two are usually "channel closed" cascades of the former. Every suppressed
-/// error is still logged.
+/// two are usually "channel closed" cascades of the former. A `DumpCancelled`
+/// cascade never outranks a real error regardless of position. Every
+/// suppressed error is still logged.
 fn select_root_cause(
     output_error: Option<anyhow::Error>,
     retrieval_error: Option<anyhow::Error>,
@@ -85,8 +107,14 @@ fn select_root_cause(
         .into_iter()
         .flatten()
     {
-        if root_cause.is_none() {
-            root_cause = Some(error);
+        let replaces_current = match &root_cause {
+            None => true,
+            Some(current) => is_cancelled(current) && !is_cancelled(&error),
+        };
+        if replaces_current {
+            if let Some(previous) = root_cause.replace(error) {
+                log::error!("Suppressed pipeline error: {:#}", previous);
+            }
         } else {
             log::error!("Suppressed pipeline error: {:#}", error);
         }
@@ -102,7 +130,7 @@ async fn close_pit_best_effort(client: &Elasticsearch, shared_pit: &Option<Share
         return;
     };
 
-    let latest_id = shared_pit.latest_id().await;
+    let latest_id = shared_pit.latest_id();
     let close_response = client
         .close_point_in_time()
         .body(sonic_rs::json!({ "id": latest_id }))
@@ -128,6 +156,38 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     debug!("Starting data dump operation for index: {}", index);
     let start_time = Instant::now();
 
+    // Pipeline-wide cancellation: fired by Ctrl+C, output failures, and
+    // failing slices. `cancel_reason` records WHY (set at most once) so the
+    // final outcome can distinguish an interrupt from a closed stdout reader.
+    let cancel = CancellationToken::new();
+    let cancel_reason: Arc<OnceLock<CancelReason>> = Arc::new(OnceLock::new());
+
+    // First Ctrl+C cancels the pipeline for an orderly shutdown (scroll/PIT
+    // cleanup, staged-output abort); a second one force-quits with the
+    // conventional 130 exit status.
+    let signal_task = tokio::spawn({
+        let cancel = cancel.clone();
+        let reason = cancel_reason.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = reason.set(CancelReason::Interrupt);
+                log::warn!(
+                    "Interrupt received; cancelling dump and cleaning up (press Ctrl+C again to force-quit)"
+                );
+                cancel.cancel();
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    std::process::exit(130);
+                }
+            }
+        }
+    });
+    let _signal_guard = AbortOnDrop(signal_task);
+
+    let retry = RetryPolicy {
+        attempts: args.retry_attempts,
+        base_delay: Duration::from_millis(args.retry_delay_ms),
+    };
+
     // Prepare search body from user input
     let search_body = search_body::prepare_search_body(&args).await?;
 
@@ -139,8 +199,10 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     let use_sliced_scroll = slices > 0;
     let num_slices = if use_sliced_scroll { slices } else { 1 };
 
-    // A slice has at most one batch awaiting extraction at a time, so workers
-    // beyond the slice count can never receive work.
+    // Extra workers beyond the slice count would still receive round-robined
+    // jobs, but each slice keeps at most one unreplied job in flight, so
+    // concurrent extraction can never exceed num_slices; more workers add
+    // threads without adding parallelism.
     let workers = args.workers.min(num_slices);
     if workers < args.workers {
         info!(
@@ -195,35 +257,77 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         start_time,
     )?;
 
-    let (output_target, shared_pit) = create_output_target_and_shared_pit(
+    let (output_target, shared_pit) = match create_output_target_and_shared_pit(
         &args.search_type,
         || crate::output::create_output_target(&args),
         |output_target| async move { output_target.abort().await },
-        || SharedPitCoordinator::open(client, index, &args.pit_keep_alive, num_slices),
+        || {
+            SharedPitCoordinator::open(
+                client,
+                index,
+                &args.pit_keep_alive,
+                num_slices,
+                retry,
+                cancel.clone(),
+            )
+        },
     )
-    .await?;
+    .await
+    {
+        Ok(targets) => targets,
+        // Ctrl+C while the PIT open is retrying with backoff surfaces here as
+        // a DumpCancelled; report it as the interrupt it is.
+        Err(error) => {
+            if matches!(cancel_reason.get(), Some(CancelReason::Interrupt)) && is_cancelled(&error)
+            {
+                return Err(anyhow::anyhow!("dump interrupted by user"));
+            }
+            return Err(error);
+        }
+    };
 
     // Drop the sender to signal no more processing will happen after worker clones are done.
     drop(processed_tx);
 
-    // Output task
-    let output_task = tokio::spawn(async move {
-        let mut output_target = output_target;
+    // Output task. Any write failure cancels the pipeline so retrieval stops
+    // promptly instead of dumping into a dead sink. A broken pipe on stdout is
+    // the reader legitimately closing early (e.g. `| head`): record it, then
+    // drain-and-discard so blocked workers/slices can unwind and observe the
+    // cancellation.
+    let output_task = tokio::spawn({
+        let cancel = cancel.clone();
+        let cancel_reason = Arc::clone(&cancel_reason);
+        async move {
+            let mut output_target = output_target;
 
-        // Process output as it comes in
-        while let Some(processed) = processed_rx.recv().await {
-            // Write the entire buffer from the processed batch
-            if let Err(e) = output_target.write_all(&processed.buffer).await {
-                output_target.abort().await;
-                return Err(anyhow::anyhow!("Failed to write batch buffer: {}", e));
+            // Process output as it comes in
+            while let Some(processed) = processed_rx.recv().await {
+                // Write the entire buffer from the processed batch
+                if let Err(e) = output_target.write_all(&processed.buffer).await {
+                    if output_target.is_stdout() && crate::output::is_broken_pipe(&e) {
+                        let _ = cancel_reason.set(CancelReason::OutputClosed);
+                        cancel.cancel();
+                        while processed_rx.recv().await.is_some() {}
+                        return Ok(output_target);
+                    }
+                    cancel.cancel();
+                    output_target.abort().await;
+                    return Err(anyhow::anyhow!("Failed to write batch buffer: {}", e));
+                }
             }
-        }
 
-        if let Err(e) = output_target.flush().await {
-            output_target.abort().await;
-            return Err(anyhow::anyhow!("Failed to flush writer: {}", e));
+            if let Err(e) = output_target.flush().await {
+                if output_target.is_stdout() && crate::output::is_broken_pipe(&e) {
+                    let _ = cancel_reason.set(CancelReason::OutputClosed);
+                    cancel.cancel();
+                    return Ok(output_target);
+                }
+                cancel.cancel();
+                output_target.abort().await;
+                return Err(anyhow::anyhow!("Failed to flush writer: {}", e));
+            }
+            Ok(output_target)
         }
-        Ok(output_target)
     });
 
     let total_hits_count = Arc::new(AtomicU64::new(0));
@@ -237,6 +341,8 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         retrieved_count: Arc::clone(&retrieved_count),
         retrieved_bytes: Arc::clone(&retrieved_bytes),
         start_time,
+        cancel: cancel.clone(),
+        retry,
     };
 
     debug!(
@@ -274,7 +380,9 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         retrieval_tasks.push(task);
     }
 
-    // First retrieval error becomes a root-cause candidate; the rest are logged.
+    // First retrieval error becomes a root-cause candidate; the rest are
+    // logged. A real failure always displaces a `DumpCancelled` cascade, no
+    // matter which slice finished first.
     let mut retrieval_error: Option<anyhow::Error> = None;
 
     // Wait for all retrieval tasks to complete and get total hits
@@ -285,12 +393,23 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
                 total_hits_are_exact &= slice_hits.is_exact;
                 continue;
             }
-            Ok(Err(e)) => anyhow::anyhow!("Retrieval task failed: {}", e),
+            // `context` (not a reformatting `anyhow!`) keeps the DumpCancelled
+            // sentinel downcastable for the final outcome selection.
+            Ok(Err(e)) => e.context("Retrieval task failed"),
             Err(e) => anyhow::anyhow!("Retrieval task panicked: {}", e),
         };
 
-        if retrieval_error.is_none() {
-            retrieval_error = Some(error);
+        let replaces_current = match &retrieval_error {
+            None => true,
+            Some(current) => is_cancelled(current) && !is_cancelled(&error),
+        };
+        if replaces_current {
+            if let Some(previous) = retrieval_error.replace(error) {
+                log::error!(
+                    "Suppressed additional retrieval task failure: {:#}",
+                    previous
+                );
+            }
         } else {
             log::error!("Suppressed additional retrieval task failure: {:#}", error);
         }
@@ -356,12 +475,49 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         Err(e) => Some(anyhow::anyhow!("Output task panicked: {}", e)),
     };
 
-    if let Some(error) = select_root_cause(output_error, retrieval_error, worker_error) {
+    let mut root_cause = select_root_cause(output_error, retrieval_error, worker_error);
+
+    // The stdout reader closing early (e.g. `| head`) is a legitimate way to
+    // end a dump: the resulting DumpCancelled cascade counts as success. A
+    // real error that surfaced alongside it still wins.
+    if matches!(cancel_reason.get(), Some(CancelReason::OutputClosed))
+        && root_cause.as_ref().is_some_and(is_cancelled)
+    {
+        root_cause = None;
+    }
+
+    // Ctrl+C makes the dump fail deterministically after the normal
+    // error-path cleanup; a concurrent real error still takes priority over
+    // the generic interrupt message.
+    if matches!(cancel_reason.get(), Some(CancelReason::Interrupt)) {
+        let error = match root_cause {
+            Some(error) if !is_cancelled(&error) => error,
+            Some(cascade) => {
+                log::debug!(
+                    "Suppressed cancellation cascade after interrupt: {:#}",
+                    cascade
+                );
+                anyhow::anyhow!("dump interrupted by user")
+            }
+            None => anyhow::anyhow!("dump interrupted by user"),
+        };
         if let Some(output_target) = completed_output_target {
             output_target.abort().await;
         }
         close_pit_best_effort(client, &shared_pit).await;
         return Err(error);
+    }
+
+    if let Some(error) = root_cause {
+        if let Some(output_target) = completed_output_target {
+            output_target.abort().await;
+        }
+        close_pit_best_effort(client, &shared_pit).await;
+        return Err(error);
+    }
+
+    if matches!(cancel_reason.get(), Some(CancelReason::OutputClosed)) {
+        log::info!("stdout closed by reader; stopping dump early");
     }
 
     let output_target = completed_output_target.ok_or_else(|| {
@@ -464,6 +620,30 @@ mod tests {
     #[test]
     fn select_root_cause_is_none_without_errors() {
         assert!(select_root_cause(None, None, None).is_none());
+    }
+
+    #[test]
+    fn select_root_cause_prefers_real_errors_over_cancellation_cascades() {
+        use super::retrieval_task::DumpCancelled;
+
+        // A cancellation cascade in a higher-priority slot must not mask the
+        // real failure that triggered it.
+        let root = select_root_cause(
+            Some(anyhow::Error::new(DumpCancelled).context("Output task failed")),
+            Some(anyhow!("HTTP 500 from slice 2")),
+            None,
+        )
+        .expect("root cause expected");
+        assert!(root.to_string().contains("HTTP 500"));
+
+        // With nothing but cascades, the first one is still reported.
+        let root = select_root_cause(
+            None,
+            Some(anyhow::Error::new(DumpCancelled).context("Retrieval task failed")),
+            None,
+        )
+        .expect("root cause expected");
+        assert!(super::retrieval_task::is_cancelled(&root));
     }
 
     #[tokio::test]

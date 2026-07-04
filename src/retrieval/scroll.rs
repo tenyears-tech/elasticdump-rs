@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use elasticsearch::{ScrollParts, SearchParts};
 use log::{debug, info};
 use sonic_rs::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cli::SearchType;
 
@@ -9,8 +10,8 @@ use super::{
     context::RetrievalContext,
     extract::BatchMetadata,
     retrieval_task::{
-        TotalHitsEstimate, cleanup_search_context, process_response_batch,
-        read_checked_response_bytes, record_total_hits,
+        DumpCancelled, RetryMode, TotalHitsEstimate, cleanup_search_context,
+        process_response_batch, record_total_hits, send_checked_with_retry,
     },
     slice_state::SliceState,
 };
@@ -40,33 +41,38 @@ pub(crate) async fn run_scroll_slice(
         state.slice_id, state.search_body["size"]
     );
 
-    let response = match ctx
-        .client
-        .search(SearchParts::Index(&[ctx.index.as_ref()]))
-        .scroll(scroll_ttl)
-        .allow_partial_search_results(false)
-        .body(&state.search_body)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            debug!(
-                "Slice {}: Initial search request successful",
-                state.slice_id
-            );
-            response
-        }
-        Err(error) => {
-            return Err(anyhow!(
-                "Slice {}: Failed to initiate search: {} - this might indicate connection issues or invalid credentials",
-                state.slice_id,
-                error
-            ));
-        }
-    };
+    if ctx.cancel.is_cancelled() {
+        return Err(anyhow::Error::new(DumpCancelled));
+    }
 
-    let response_bytes =
-        read_checked_response_bytes(response, state.slice_id, "initial search").await?;
+    // The initial search is idempotent: repeating it opens a fresh scroll
+    // context instead of advancing an existing cursor, so full retries are
+    // safe. A retry after a lost response can strand the previous attempt's
+    // scroll context until its TTL expires; the closure logs that case.
+    let index_refs = [ctx.index.as_ref()];
+    let initial_attempted = AtomicBool::new(false);
+    let response_bytes = send_checked_with_retry(
+        ctx.retry,
+        &ctx.cancel,
+        RetryMode::Idempotent,
+        state.slice_id,
+        "initial search",
+        || {
+            if initial_attempted.swap(true, Ordering::Relaxed) {
+                debug!(
+                    "Slice {}: retrying initial search; a previous attempt whose response was lost may strand a scroll context until its TTL expires",
+                    state.slice_id
+                );
+            }
+            ctx.client
+                .search(SearchParts::Index(&index_refs))
+                .scroll(scroll_ttl)
+                .allow_partial_search_results(false)
+                .body(&state.search_body)
+                .send()
+        },
+    )
+    .await?;
     let initial_bytes = response_bytes.len() as u64;
     debug!(
         "Slice {}: Read {} bytes for initial response",
@@ -110,31 +116,44 @@ pub(crate) async fn run_scroll_slice(
     let mut done = metadata.hits_are_empty;
 
     while !done {
-        let next_response = match ctx
-            .client
-            .scroll(ScrollParts::None)
-            .body(build_scroll_request_body(
-                scroll_ttl,
-                state.current_id.as_deref().ok_or_else(|| {
-                    anyhow!(
-                        "No ID found for slice {} to continue search",
-                        state.slice_id
-                    )
-                })?,
-            ))
-            .send()
-            .await
-        {
-            Ok(response) => {
-                debug!("Slice {}: Next batch request successful", state.slice_id);
-                response
+        if ctx.cancel.is_cancelled() {
+            if let Some(scroll_id) = state.current_id.as_deref() {
+                cleanup_search_context(&ctx.client, &SearchType::Scroll, scroll_id, state.slice_id)
+                    .await;
             }
+            return Err(anyhow::Error::new(DumpCancelled));
+        }
+
+        let request_body = build_scroll_request_body(
+            scroll_ttl,
+            state.current_id.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "No ID found for slice {} to continue search",
+                    state.slice_id
+                )
+            })?,
+        );
+
+        // NOT idempotent: every continuation call advances the server-side
+        // cursor, so RejectionOnly retries this request only on HTTP 429,
+        // where the server rejected it without moving the cursor.
+        let next_response_bytes = match send_checked_with_retry(
+            ctx.retry,
+            &ctx.cancel,
+            RetryMode::RejectionOnly,
+            state.slice_id,
+            "continuation search",
+            || {
+                ctx.client
+                    .scroll(ScrollParts::None)
+                    .body(&request_body)
+                    .send()
+            },
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
             Err(error) => {
-                let search_error = anyhow!(
-                    "Slice {}: Search continuation error: {}",
-                    state.slice_id,
-                    error
-                );
                 if let Some(scroll_id) = state.current_id.as_deref() {
                     cleanup_search_context(
                         &ctx.client,
@@ -144,28 +163,9 @@ pub(crate) async fn run_scroll_slice(
                     )
                     .await;
                 }
-                return Err(search_error);
+                return Err(error);
             }
         };
-
-        let next_response_bytes =
-            match read_checked_response_bytes(next_response, state.slice_id, "continuation search")
-                .await
-            {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    if let Some(scroll_id) = state.current_id.as_deref() {
-                        cleanup_search_context(
-                            &ctx.client,
-                            &SearchType::Scroll,
-                            scroll_id,
-                            state.slice_id,
-                        )
-                        .await;
-                    }
-                    return Err(error);
-                }
-            };
 
         let batch_bytes = next_response_bytes.len() as u64;
         debug!(

@@ -1,8 +1,11 @@
 use anyhow::{Result, anyhow};
 use elasticsearch::{Elasticsearch, OpenPointInTimeParts};
 use sonic_rs::JsonValueTrait;
-use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+
+use super::retrieval_task::{DumpCancelled, RetryMode, RetryPolicy, send_checked_with_retry};
 
 fn parse_pit_open_id(body: &[u8]) -> Result<String> {
     let json: sonic_rs::Value = sonic_rs::from_slice(body)?;
@@ -34,6 +37,7 @@ struct PitState {
 pub struct SharedPitCoordinator {
     inner: Arc<Mutex<PitState>>,
     notify: Arc<Notify>,
+    cancel: CancellationToken,
 }
 
 impl SharedPitCoordinator {
@@ -42,20 +46,28 @@ impl SharedPitCoordinator {
         index: &str,
         keep_alive: &str,
         active_slices: usize,
+        retry: RetryPolicy,
+        cancel: CancellationToken,
     ) -> Result<Self> {
-        let response = client
-            .open_point_in_time(OpenPointInTimeParts::Index(&[index]))
-            .keep_alive(keep_alive)
-            .send()
-            .await?;
+        let indices = [index];
         let body =
-            super::retrieval_task::read_checked_response_bytes(response, 0, "PIT open").await?;
+            send_checked_with_retry(retry, &cancel, RetryMode::Idempotent, 0, "PIT open", || {
+                client
+                    .open_point_in_time(OpenPointInTimeParts::Index(&indices))
+                    .keep_alive(keep_alive)
+                    .send()
+            })
+            .await?;
         let id = parse_pit_open_id(&body)?;
 
-        Ok(Self::new_for_test(id, active_slices))
+        Ok(Self::new_for_test(id, active_slices, cancel))
     }
 
-    pub fn new_for_test(current_id: String, active_slices: usize) -> Self {
+    pub fn new_for_test(
+        current_id: String,
+        active_slices: usize,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(PitState {
                 latest_observed_id: current_id.clone(),
@@ -68,11 +80,12 @@ impl SharedPitCoordinator {
                 aborted: None,
             })),
             notify: Arc::new(Notify::new()),
+            cancel,
         }
     }
 
-    pub async fn acquire(&self) -> PitLease {
-        let state = self.inner.lock().await;
+    pub fn acquire(&self) -> PitLease {
+        let state = self.inner.lock().unwrap();
         PitLease {
             generation: state.generation,
             id: state.current_id.clone(),
@@ -81,9 +94,16 @@ impl SharedPitCoordinator {
 
     pub async fn wait_for_generation(&self, generation: u64) -> Result<PitLease> {
         loop {
+            // Cancellation takes precedence over an abort message: once the
+            // pipeline token fires, guard-driven aborts are cascade noise and
+            // every waiter must report the cancellation sentinel instead.
+            if self.cancel.is_cancelled() {
+                return Err(anyhow::Error::new(DumpCancelled));
+            }
+
             let notified = self.notify.notified();
             let maybe_lease = {
-                let state = self.inner.lock().await;
+                let state = self.inner.lock().unwrap();
                 if let Some(error) = &state.aborted {
                     return Err(anyhow!(error.clone()));
                 }
@@ -102,17 +122,24 @@ impl SharedPitCoordinator {
                 return Ok(lease);
             }
 
-            notified.await;
+            tokio::select! {
+                _ = notified => {}
+                _ = self.cancel.cancelled() => return Err(anyhow::Error::new(DumpCancelled)),
+            }
         }
     }
 
-    pub async fn complete_round(
+    pub fn complete_round(
         &self,
         generation: u64,
         returned_id: Option<String>,
         slice_finished: bool,
     ) -> Result<()> {
-        let mut state = self.inner.lock().await;
+        if self.cancel.is_cancelled() {
+            return Err(anyhow::Error::new(DumpCancelled));
+        }
+
+        let mut state = self.inner.lock().unwrap();
         if let Some(error) = &state.aborted {
             return Err(anyhow!(error.clone()));
         }
@@ -151,24 +178,56 @@ impl SharedPitCoordinator {
         Ok(())
     }
 
-    pub async fn abort(&self, error: String) {
-        let mut state = self.inner.lock().await;
+    pub fn abort(&self, error: String) {
+        let mut state = self.inner.lock().unwrap();
         if state.aborted.is_none() {
             state.aborted = Some(error);
             self.notify.notify_waiters();
         }
     }
 
-    pub async fn observe_returned_id(&self, returned_id: Option<&str>) {
+    pub fn observe_returned_id(&self, returned_id: Option<&str>) {
         let Some(returned_id) = returned_id else {
             return;
         };
-        let mut state = self.inner.lock().await;
+        let mut state = self.inner.lock().unwrap();
         state.latest_observed_id = returned_id.to_string();
     }
 
-    pub async fn latest_id(&self) -> String {
-        self.inner.lock().await.latest_observed_id.clone()
+    pub fn latest_id(&self) -> String {
+        self.inner.lock().unwrap().latest_observed_id.clone()
+    }
+}
+
+/// Aborts the shared PIT coordinator when dropped while still armed, so a
+/// panicking or otherwise abruptly terminated slice can never strand its
+/// siblings parked in `wait_for_generation`. Defuse before returning success;
+/// error returns may leave it armed because `abort` is idempotent and the
+/// first (more specific) abort message wins.
+pub(crate) struct PitAbortGuard {
+    coordinator: SharedPitCoordinator,
+    armed: bool,
+}
+
+impl PitAbortGuard {
+    pub(crate) fn new(coordinator: SharedPitCoordinator) -> Self {
+        Self {
+            coordinator,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PitAbortGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.coordinator
+                .abort("PIT slice terminated unexpectedly (panic or cancellation)".into());
+        }
     }
 }
 
@@ -194,10 +253,14 @@ mod tests {
 
     #[tokio::test]
     async fn shared_pit_advances_generation_after_all_active_slices_report() {
-        let shared = super::SharedPitCoordinator::new_for_test("pit-0".into(), 2);
+        let shared = super::SharedPitCoordinator::new_for_test(
+            "pit-0".into(),
+            2,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
-        let lease_a = shared.acquire().await;
-        let lease_b = shared.acquire().await;
+        let lease_a = shared.acquire();
+        let lease_b = shared.acquire();
 
         assert_eq!(lease_a.generation, 0);
         assert_eq!(lease_b.generation, 0);
@@ -206,7 +269,6 @@ mod tests {
 
         shared
             .complete_round(lease_a.generation, Some("pit-a-next".into()), false)
-            .await
             .unwrap();
 
         let still_blocked =
@@ -215,7 +277,6 @@ mod tests {
 
         shared
             .complete_round(lease_b.generation, Some("pit-b-next".into()), false)
-            .await
             .unwrap();
 
         let lease_next = shared.wait_for_generation(1).await.unwrap();
@@ -225,18 +286,20 @@ mod tests {
 
     #[tokio::test]
     async fn shared_pit_drops_finished_slices_from_future_generations() {
-        let shared = super::SharedPitCoordinator::new_for_test("pit-0".into(), 2);
+        let shared = super::SharedPitCoordinator::new_for_test(
+            "pit-0".into(),
+            2,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
-        let lease_a = shared.acquire().await;
-        let lease_b = shared.acquire().await;
+        let lease_a = shared.acquire();
+        let lease_b = shared.acquire();
 
         shared
             .complete_round(lease_a.generation, Some("pit-a-next".into()), true)
-            .await
             .unwrap();
         shared
             .complete_round(lease_b.generation, Some("pit-b-next".into()), false)
-            .await
             .unwrap();
 
         let lease_next = shared.wait_for_generation(1).await.unwrap();
@@ -244,7 +307,6 @@ mod tests {
 
         shared
             .complete_round(lease_next.generation, Some("pit-b-next-2".into()), false)
-            .await
             .unwrap();
 
         let lease_final = shared.wait_for_generation(2).await.unwrap();
@@ -253,13 +315,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_generation_returns_error_when_cancelled() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let shared = super::SharedPitCoordinator::new_for_test("pit-0".into(), 2, cancel.clone());
+
+        let waiter = tokio::spawn({
+            let shared = shared.clone();
+            async move { shared.wait_for_generation(1).await }
+        });
+
+        // Let the waiter park before firing the cancellation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled waiter must return promptly")
+            .expect("waiter task must not panic");
+        let error = result.expect_err("cancellation must surface as an error");
+        assert!(
+            crate::retrieval::retrieval_task::is_cancelled(&error),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_guard_aborts_coordinator_on_drop() {
+        let shared = super::SharedPitCoordinator::new_for_test(
+            "pit-0".into(),
+            2,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        // A defused guard must not abort the coordinator.
+        let guard = super::PitAbortGuard::new(shared.clone());
+        guard.defuse();
+        let lease = shared
+            .wait_for_generation(0)
+            .await
+            .expect("defused guard must not abort the coordinator");
+        assert_eq!(lease.generation, 0);
+
+        let waiter = tokio::spawn({
+            let shared = shared.clone();
+            async move { shared.wait_for_generation(1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        drop(super::PitAbortGuard::new(shared.clone()));
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("aborted waiter must return promptly")
+            .expect("waiter task must not panic");
+        let error = result.expect_err("armed guard drop must abort the coordinator");
+        assert!(
+            error
+                .to_string()
+                .contains("PIT slice terminated unexpectedly"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn shared_pit_tracks_latest_observed_id_for_final_cleanup() {
-        let shared = super::SharedPitCoordinator::new_for_test("pit-0".into(), 2);
+        let shared = super::SharedPitCoordinator::new_for_test(
+            "pit-0".into(),
+            2,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
-        shared.observe_returned_id(Some("pit-1")).await;
+        shared.observe_returned_id(Some("pit-1"));
 
-        let lease = shared.acquire().await;
+        let lease = shared.acquire();
         assert_eq!(lease.id, "pit-0");
-        assert_eq!(shared.latest_id().await, "pit-1");
+        assert_eq!(shared.latest_id(), "pit-1");
     }
 }

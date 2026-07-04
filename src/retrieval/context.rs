@@ -5,8 +5,10 @@ use std::{
     time::Instant,
 };
 use tokio::sync::mpsc::Sender;
+use tokio_util::sync::CancellationToken;
 
 use super::messages::RetrievalMessage;
+use super::retrieval_task::RetryPolicy;
 
 #[derive(Clone)]
 pub(crate) struct RetrievalContext {
@@ -19,4 +21,8 @@ pub(crate) struct RetrievalContext {
     pub(crate) retrieved_count: Arc<AtomicU64>,
     pub(crate) retrieved_bytes: Arc<AtomicU64>,
     pub(crate) start_time: Instant,
+    /// Cancels the whole pipeline: signal handler, output failures, and
+    /// failing sibling slices all fire the same token.
+    pub(crate) cancel: CancellationToken,
+    pub(crate) retry: RetryPolicy,
 }
