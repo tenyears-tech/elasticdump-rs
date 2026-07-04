@@ -30,6 +30,7 @@ BENCH_INDEX_NAME="${BENCH_INDEX_NAME:-}"
 BENCH_WORKDIR="${BENCH_WORKDIR:-}"
 BENCH_RS_BIN="${BENCH_RS_BIN:-}"
 BENCH_ELASTICDUMP_CMD="${BENCH_ELASTICDUMP_CMD:-elasticdump}"
+BENCH_CPU_CORES="${BENCH_CPU_CORES:-}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -79,6 +80,9 @@ Options:
   --workdir DIR               Artifact work directory
   --rs-bin PATH               Path to the elasticdump-rs binary
   --elasticdump-cmd CMD       Command used to invoke the original elasticdump
+  --cpu-cores N               Limit each timed tool run to N CPU cores
+                              (Linux: taskset affinity; macOS: cpulimit
+                              duty-cycle cap; empty = unlimited)
   --help                      Show this help text
 
 Environment variables with the same names are also supported.
@@ -188,6 +192,11 @@ parse_args() {
         BENCH_ELASTICDUMP_CMD="$2"
         shift 2
         ;;
+      --cpu-cores)
+        require_option_value "$@"
+        BENCH_CPU_CORES="$2"
+        shift 2
+        ;;
       --help)
         print_usage
         exit 0
@@ -247,6 +256,33 @@ validate_uint() {
   [[ ! "$value" =~ ^0[0-9]+$ ]] || die "${name} must not use leading-zero notation, got: ${value}"
 }
 
+cpu_limit_platform() {
+  local kernel_name
+
+  kernel_name="$(uname -s)"
+  case "${kernel_name}" in
+    Linux)
+      printf 'linux\n'
+      ;;
+    Darwin)
+      printf 'darwin\n'
+      ;;
+    *)
+      die "BENCH_CPU_CORES is not supported on this platform: ${kernel_name}"
+      ;;
+  esac
+}
+
+available_cpu_cores() {
+  local platform="$1"
+
+  if [[ "${platform}" == "linux" ]]; then
+    nproc
+  else
+    sysctl -n hw.ncpu
+  fi
+}
+
 split_search_types() {
   local raw="$1"
   local part
@@ -281,6 +317,9 @@ validate_index_name() {
 }
 
 validate_config() {
+  local cpu_limit_platform_name
+  local available_cores
+
   validate_uint "BENCH_DOCS" "${BENCH_DOCS}"
   validate_uint "BENCH_BULK_SIZE" "${BENCH_BULK_SIZE}"
   validate_uint "BENCH_LIMIT" "${BENCH_LIMIT}"
@@ -322,6 +361,14 @@ validate_config() {
   (( BENCH_BULK_SIZE > 0 )) || die "BENCH_BULK_SIZE must be greater than zero"
   (( BENCH_LIMIT > 0 )) || die "BENCH_LIMIT must be greater than zero"
   (( BENCH_MAX_NUM_SEGMENTS > 0 )) || die "BENCH_MAX_NUM_SEGMENTS must be greater than zero"
+
+  if [[ -n "${BENCH_CPU_CORES}" ]]; then
+    validate_uint "BENCH_CPU_CORES" "${BENCH_CPU_CORES}"
+    (( BENCH_CPU_CORES > 0 )) || die "BENCH_CPU_CORES must be greater than zero"
+    cpu_limit_platform_name="$(cpu_limit_platform)"
+    available_cores="$(available_cpu_cores "${cpu_limit_platform_name}")"
+    (( BENCH_CPU_CORES <= available_cores )) || die "BENCH_CPU_CORES must not exceed available CPU cores (${available_cores}), got: ${BENCH_CPU_CORES}"
+  fi
 }
 
 resolve_python() {
