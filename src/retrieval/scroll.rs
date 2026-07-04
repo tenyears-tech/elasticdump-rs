@@ -23,7 +23,11 @@ pub(crate) fn build_scroll_request_body(scroll_ttl: &str, scroll_id: &str) -> Va
 }
 
 pub(crate) fn apply_scroll_batch_metadata(state: &mut SliceState, metadata: &BatchMetadata) {
-    state.current_id = metadata.next_scroll_id.clone();
+    // Keep the previous scroll id when a response lacks one: overwriting it
+    // with None would make both continuation and cleanup impossible.
+    if let Some(next_scroll_id) = &metadata.next_scroll_id {
+        state.current_id = Some(next_scroll_id.clone());
+    }
 }
 
 pub(crate) async fn run_scroll_slice(
@@ -40,6 +44,7 @@ pub(crate) async fn run_scroll_slice(
         .client
         .search(SearchParts::Index(&[ctx.index.as_ref()]))
         .scroll(scroll_ttl)
+        .allow_partial_search_results(false)
         .body(&state.search_body)
         .send()
         .await
@@ -254,5 +259,27 @@ mod tests {
         super::apply_scroll_batch_metadata(&mut state, &metadata);
 
         assert_eq!(state.current_id.as_deref(), Some("scroll-new"));
+    }
+
+    #[test]
+    fn apply_scroll_batch_metadata_keeps_previous_id_when_response_lacks_one() {
+        let mut state = SliceState::new(0, 0, json!({"size": 10}));
+        state.current_id = Some("scroll-live".into());
+
+        let metadata = BatchMetadata {
+            total_hits: TotalHitsEstimate {
+                value: 2,
+                is_exact: true,
+            },
+            next_scroll_id: None,
+            next_pit_id: None,
+            last_sort_raw: None,
+            doc_count: 2,
+            hits_are_empty: false,
+        };
+
+        super::apply_scroll_batch_metadata(&mut state, &metadata);
+
+        assert_eq!(state.current_id.as_deref(), Some("scroll-live"));
     }
 }

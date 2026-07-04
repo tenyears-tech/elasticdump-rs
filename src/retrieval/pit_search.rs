@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use elasticsearch::SearchParts;
 use log::{debug, info};
-use sonic_rs::{JsonValueMutTrait, Value, json};
+use sonic_rs::{JsonValueMutTrait, JsonValueTrait, Value, json};
 
 use crate::cli::SearchType;
 
@@ -65,6 +65,21 @@ pub(crate) fn apply_pit_batch_metadata(state: &mut SliceState, metadata: &BatchM
     state.update_search_after_from_raw(metadata.last_sort_raw.as_deref());
 }
 
+/// Requested page size of the slice's search body, used to detect an
+/// exhausted slice early. Falls back to 0 ("size unknown, never finish
+/// early") if the size is missing or not an integer, so an unexpected body
+/// shape degrades to empty-round termination instead of truncating the dump.
+fn pit_batch_size(search_body: &Value) -> u64 {
+    search_body["size"].as_u64().unwrap_or(0)
+}
+
+/// Under `search_after` pagination a page shorter than the requested size
+/// proves the slice is exhausted, so the guaranteed trailing empty round can
+/// be skipped.
+fn pit_slice_finished(metadata: &BatchMetadata, batch_size: u64) -> bool {
+    metadata.hits_are_empty || metadata.doc_count < batch_size
+}
+
 pub(crate) async fn run_pit_slice(
     ctx: &RetrievalContext,
     state: &mut SliceState,
@@ -73,6 +88,7 @@ pub(crate) async fn run_pit_slice(
 ) -> Result<TotalHitsEstimate> {
     let shared_pit = shared_pit.expect("PIT mode requires shared coordinator");
     ensure_pit_sort(&mut state.search_body);
+    let batch_size = pit_batch_size(&state.search_body);
 
     let lease = shared_pit.acquire().await;
     state.pit_generation = Some(lease.generation);
@@ -87,6 +103,7 @@ pub(crate) async fn run_pit_slice(
     let response = match ctx
         .client
         .search(SearchParts::None)
+        .allow_partial_search_results(false)
         .body(&request_body)
         .send()
         .await
@@ -157,13 +174,13 @@ pub(crate) async fn run_pit_slice(
         .observe_returned_id(state.current_id.as_deref())
         .await;
 
-    let initial_hits_are_empty = metadata.hits_are_empty;
+    let initial_slice_finished = pit_slice_finished(&metadata, batch_size);
 
     if let Err(error) = shared_pit
         .complete_round(
             state.pit_generation.expect("PIT generation should be set"),
             state.current_id.clone(),
-            initial_hits_are_empty,
+            initial_slice_finished,
         )
         .await
     {
@@ -171,7 +188,7 @@ pub(crate) async fn run_pit_slice(
         return Err(error);
     }
 
-    if initial_hits_are_empty {
+    if initial_slice_finished {
         info!(
             "Search finished for slice {}, no more documents.",
             state.slice_id
@@ -214,6 +231,7 @@ pub(crate) async fn run_pit_slice(
         let next_response = match ctx
             .client
             .search(SearchParts::None)
+            .allow_partial_search_results(false)
             .body(&request_body)
             .send()
             .await
@@ -283,13 +301,13 @@ pub(crate) async fn run_pit_slice(
             .observe_returned_id(state.current_id.as_deref())
             .await;
 
-        let hits_are_empty = metadata.hits_are_empty;
+        let slice_finished = pit_slice_finished(&metadata, batch_size);
 
         if let Err(error) = shared_pit
             .complete_round(
                 state.pit_generation.expect("PIT generation should be set"),
                 state.current_id.clone(),
-                hits_are_empty,
+                slice_finished,
             )
             .await
         {
@@ -297,7 +315,7 @@ pub(crate) async fn run_pit_slice(
             return Err(error);
         }
 
-        if hits_are_empty {
+        if slice_finished {
             info!(
                 "Search finished for slice {}, no more documents.",
                 state.slice_id
@@ -467,5 +485,42 @@ mod tests {
             state.search_after.as_deref(),
             Some(br#"[2,{"nested":true}]"#.as_slice())
         );
+    }
+
+    fn metadata_with_docs(doc_count: u64, hits_are_empty: bool) -> BatchMetadata {
+        BatchMetadata {
+            total_hits: TotalHitsEstimate {
+                value: doc_count,
+                is_exact: true,
+            },
+            next_scroll_id: None,
+            next_pit_id: Some("pit-x".to_string()),
+            last_sort_raw: None,
+            doc_count,
+            hits_are_empty,
+        }
+    }
+
+    #[test]
+    fn pit_slice_finished_on_short_page_or_empty_hits_but_not_full_page() {
+        assert!(!super::pit_slice_finished(
+            &metadata_with_docs(10, false),
+            10
+        ));
+        assert!(super::pit_slice_finished(&metadata_with_docs(3, false), 10));
+        assert!(super::pit_slice_finished(&metadata_with_docs(0, true), 10));
+    }
+
+    #[test]
+    fn pit_batch_size_reads_size_and_disables_early_finish_when_missing() {
+        assert_eq!(super::pit_batch_size(&json!({"size": 500})), 500);
+
+        // Missing or malformed size must never finish a slice early; the
+        // slice then falls back to empty-round termination.
+        let unknown = super::pit_batch_size(&json!({"query": {"match_all": {}}}));
+        assert!(!super::pit_slice_finished(
+            &metadata_with_docs(10, false),
+            unknown
+        ));
     }
 }

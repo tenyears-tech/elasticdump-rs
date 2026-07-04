@@ -13,13 +13,6 @@ pub(crate) struct BatchProcessingFailure {
 }
 
 impl BatchProcessingFailure {
-    pub(crate) fn with_metadata(error: anyhow::Error, metadata: BatchMetadata) -> Self {
-        Self {
-            metadata: Some(metadata),
-            error,
-        }
-    }
-
     pub(crate) fn metadata(&self) -> Option<&BatchMetadata> {
         self.metadata.as_ref()
     }
@@ -56,7 +49,8 @@ impl std::error::Error for BatchProcessingFailure {}
 pub(crate) struct BatchJob {
     pub(crate) response_bytes: Bytes,
     pub(crate) search_type: SearchType,
-    pub(crate) reply_tx: oneshot::Sender<std::result::Result<BatchMetadata, BatchProcessingFailure>>,
+    pub(crate) reply_tx:
+        oneshot::Sender<std::result::Result<BatchMetadata, BatchProcessingFailure>>,
 }
 
 pub(crate) enum RetrievalMessage {

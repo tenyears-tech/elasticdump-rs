@@ -71,6 +71,58 @@ where
     Ok((output_target, shared_pit))
 }
 
+/// Pick the pipeline's root-cause error. The output task's error (e.g. disk
+/// full) outranks retrieval errors, which outrank worker errors: the latter
+/// two are usually "channel closed" cascades of the former. Every suppressed
+/// error is still logged.
+fn select_root_cause(
+    output_error: Option<anyhow::Error>,
+    retrieval_error: Option<anyhow::Error>,
+    worker_error: Option<anyhow::Error>,
+) -> Option<anyhow::Error> {
+    let mut root_cause: Option<anyhow::Error> = None;
+    for error in [output_error, retrieval_error, worker_error]
+        .into_iter()
+        .flatten()
+    {
+        if root_cause.is_none() {
+            root_cause = Some(error);
+        } else {
+            log::error!("Suppressed pipeline error: {:#}", error);
+        }
+    }
+    root_cause
+}
+
+/// Close the shared PIT as best-effort cleanup. Failures are only warned
+/// about: the PIT expires on its own via its keep-alive, and a close failure
+/// must never override the pipeline outcome.
+async fn close_pit_best_effort(client: &Elasticsearch, shared_pit: &Option<SharedPitCoordinator>) {
+    let Some(shared_pit) = shared_pit else {
+        return;
+    };
+
+    let latest_id = shared_pit.latest_id().await;
+    let close_response = client
+        .close_point_in_time()
+        .body(sonic_rs::json!({ "id": latest_id }))
+        .send()
+        .await;
+
+    match close_response {
+        Ok(response) => {
+            if let Err(e) =
+                retrieval_task::read_checked_response_bytes(response, 0, "PIT close").await
+            {
+                log::warn!("Failed to close PIT (it will expire via keep-alive): {e}");
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to close PIT (it will expire via keep-alive): {e}");
+        }
+    }
+}
+
 /// Main function to dump data from Elasticsearch
 pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result<()> {
     debug!("Starting data dump operation for index: {}", index);
@@ -80,15 +132,26 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
     let search_body = search_body::prepare_search_body(&args).await?;
 
     // Create channels for the pipeline
-    let workers = args.workers;
     let buffer_size = args.buffer_size;
     let slices = args.slices;
 
+    // Setup for sliced search
+    let use_sliced_scroll = slices > 0;
+    let num_slices = if use_sliced_scroll { slices } else { 1 };
+
+    // A slice has at most one batch awaiting extraction at a time, so workers
+    // beyond the slice count can never receive work.
+    let workers = args.workers.min(num_slices);
+    if workers < args.workers {
+        info!(
+            "Clamping worker count from {} to {} to match the {} search slice(s)",
+            args.workers, workers, num_slices
+        );
+    }
+
     debug!(
         "Setting up pipeline with {} workers, buffer size {}, {} slices",
-        workers,
-        buffer_size,
-        if slices > 0 { slices } else { 1 }
+        workers, buffer_size, num_slices
     );
 
     // Create a channel for each worker
@@ -119,9 +182,6 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         (None, None, None)
     };
 
-    // Setup for sliced search
-    let use_sliced_scroll = slices > 0;
-    let num_slices = if use_sliced_scroll { slices } else { 1 };
     let mut estimated_total_hits = 0u64;
     let mut total_hits_are_exact = true;
 
@@ -214,53 +274,25 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         retrieval_tasks.push(task);
     }
 
-    let mut pipeline_error = None;
+    // First retrieval error becomes a root-cause candidate; the rest are logged.
+    let mut retrieval_error: Option<anyhow::Error> = None;
 
     // Wait for all retrieval tasks to complete and get total hits
     for task in retrieval_tasks {
-        match task.await {
-            Ok(result) => match result {
-                Ok(slice_hits) => {
-                    estimated_total_hits += slice_hits.value;
-                    total_hits_are_exact &= slice_hits.is_exact;
-                }
-                Err(e) => {
-                    if pipeline_error.is_none() {
-                        pipeline_error = Some(anyhow::anyhow!("Retrieval task failed: {}", e));
-                    }
-                }
-            },
-            Err(e) => {
-                if pipeline_error.is_none() {
-                    pipeline_error = Some(anyhow::anyhow!("Retrieval task panicked: {}", e));
-                }
+        let error = match task.await {
+            Ok(Ok(slice_hits)) => {
+                estimated_total_hits += slice_hits.value;
+                total_hits_are_exact &= slice_hits.is_exact;
+                continue;
             }
-        }
-    }
+            Ok(Err(e)) => anyhow::anyhow!("Retrieval task failed: {}", e),
+            Err(e) => anyhow::anyhow!("Retrieval task panicked: {}", e),
+        };
 
-    if let Some(shared_pit) = &shared_pit {
-        let latest_id = shared_pit.latest_id().await;
-        let close_response = client
-            .close_point_in_time()
-            .body(sonic_rs::json!({ "id": latest_id }))
-            .send()
-            .await;
-
-        match close_response {
-            Ok(response) => {
-                if let Err(e) =
-                    retrieval_task::read_checked_response_bytes(response, 0, "PIT close").await
-                {
-                    if pipeline_error.is_none() {
-                        pipeline_error = Some(anyhow::anyhow!("Failed to close PIT: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                if pipeline_error.is_none() {
-                    pipeline_error = Some(anyhow::anyhow!("Failed to close PIT: {}", e));
-                }
-            }
+        if retrieval_error.is_none() {
+            retrieval_error = Some(error);
+        } else {
+            log::error!("Suppressed additional retrieval task failure: {:#}", error);
         }
     }
 
@@ -299,45 +331,47 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
         }
     }
 
-    // Wait for all workers to finish
+    // Wait for all workers to finish. First failure becomes a root-cause
+    // candidate; the rest are logged.
+    let mut worker_error: Option<anyhow::Error> = None;
     for (i, task) in worker_tasks.into_iter().enumerate() {
         if let Err(e) = task.wait().await {
-            if pipeline_error.is_none() {
-                pipeline_error = Some(anyhow::anyhow!("Worker {} processing failed: {}", i, e));
+            let error = anyhow::anyhow!("Worker {} processing failed: {}", i, e);
+            if worker_error.is_none() {
+                worker_error = Some(error);
+            } else {
+                log::error!("Suppressed additional worker failure: {:#}", error);
             }
         }
     }
-
-    let mut completed_output_target = None;
 
     // Wait for output to finish
-    match output_task.await {
-        Ok(result) => match result {
-            Ok(output_target) => completed_output_target = Some(output_target),
-            Err(e) => {
-                if pipeline_error.is_none() {
-                    pipeline_error = Some(anyhow::anyhow!("Output task failed: {}", e));
-                }
-            }
-        },
-        Err(e) => {
-            if pipeline_error.is_none() {
-                pipeline_error = Some(anyhow::anyhow!("Output task panicked: {}", e));
-            }
+    let mut completed_output_target = None;
+    let output_error = match output_task.await {
+        Ok(Ok(output_target)) => {
+            completed_output_target = Some(output_target);
+            None
         }
-    }
+        Ok(Err(e)) => Some(anyhow::anyhow!("Output task failed: {}", e)),
+        Err(e) => Some(anyhow::anyhow!("Output task panicked: {}", e)),
+    };
 
-    if let Some(error) = pipeline_error {
+    if let Some(error) = select_root_cause(output_error, retrieval_error, worker_error) {
         if let Some(output_target) = completed_output_target {
             output_target.abort().await;
         }
+        close_pit_best_effort(client, &shared_pit).await;
         return Err(error);
     }
 
     let output_target = completed_output_target.ok_or_else(|| {
         anyhow::anyhow!("Output task completed without returning an output target")
     })?;
+
+    // Make the dump durable FIRST; PIT cleanup afterwards can no longer
+    // destroy it and is best-effort only.
     output_target.finalize().await?;
+    close_pit_best_effort(client, &shared_pit).await;
 
     let elapsed = start_time.elapsed();
     let count = processed_count.load(Ordering::Relaxed);
@@ -397,12 +431,40 @@ pub async fn dump_data(client: &Elasticsearch, index: &str, args: Cli) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::create_output_target_and_shared_pit;
+    use super::{create_output_target_and_shared_pit, select_root_cause};
     use anyhow::anyhow;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn select_root_cause_prefers_output_error_over_cascades() {
+        let root = select_root_cause(
+            Some(anyhow!("disk full")),
+            Some(anyhow!("send batch failed")),
+            Some(anyhow!("processed channel closed")),
+        )
+        .expect("root cause expected");
+
+        assert_eq!(root.to_string(), "disk full");
+    }
+
+    #[test]
+    fn select_root_cause_falls_back_to_retrieval_then_worker_error() {
+        let root = select_root_cause(None, Some(anyhow!("retrieval")), Some(anyhow!("worker")))
+            .expect("root cause expected");
+        assert_eq!(root.to_string(), "retrieval");
+
+        let root =
+            select_root_cause(None, None, Some(anyhow!("worker"))).expect("root cause expected");
+        assert_eq!(root.to_string(), "worker");
+    }
+
+    #[test]
+    fn select_root_cause_is_none_without_errors() {
+        assert!(select_root_cause(None, None, None).is_none());
+    }
 
     #[tokio::test]
     async fn create_output_target_and_shared_pit_skips_pit_when_output_fails() {

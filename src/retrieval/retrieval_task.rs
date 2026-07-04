@@ -14,7 +14,8 @@ use super::{
     context::RetrievalContext,
     messages::{BatchJob, BatchProcessingFailure, RetrievalMessage},
     pit::SharedPitCoordinator,
-    pit_search, scroll, slice_state::SliceState,
+    pit_search, scroll,
+    slice_state::SliceState,
 };
 use crate::cli::SearchType;
 
@@ -138,16 +139,18 @@ pub(crate) async fn process_response_batch(
             reply_tx,
         }))
         .await
-        .map_err(|error| recover_batch_processing_failure(
-            BatchProcessingFailure::from(anyhow!(
-                "Failed to send batch to worker {} for slice {}: {}",
-                worker,
-                state.slice_id,
-                error
-            )),
-            &recovery_bytes,
-            search_type,
-        ))?;
+        .map_err(|error| {
+            recover_batch_processing_failure(
+                BatchProcessingFailure::from(anyhow!(
+                    "Failed to send batch to worker {} for slice {}: {}",
+                    worker,
+                    state.slice_id,
+                    error
+                )),
+                &recovery_bytes,
+                search_type,
+            )
+        })?;
 
     let metadata = match reply_rx.await {
         Ok(Ok(metadata)) => metadata,
@@ -161,10 +164,10 @@ pub(crate) async fn process_response_batch(
         Err(error) => {
             return Err(recover_batch_processing_failure(
                 BatchProcessingFailure::from(anyhow!(
-            "Worker {} dropped metadata reply for slice {}: {}",
-            worker,
-            state.slice_id,
-            error
+                    "Worker {} dropped metadata reply for slice {}: {}",
+                    worker,
+                    state.slice_id,
+                    error
                 )),
                 &recovery_bytes,
                 search_type,
@@ -433,7 +436,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-next"));
-        assert_eq!(metadata.last_sort_raw.as_deref(), Some(br#"[1,"a"]"#.as_slice()));
+        assert_eq!(
+            metadata.last_sort_raw.as_deref(),
+            Some(br#"[1,"a"]"#.as_slice())
+        );
         assert!(metadata.next_scroll_id.is_none());
         assert_eq!(metadata.doc_count, 1);
         assert!(!metadata.hits_are_empty);
@@ -462,12 +468,16 @@ mod tests {
             "{\"_id\":\"1\",\"sort\":[1,\"a\"],\"_source\":{\"message\":\"a\"}}\n"
         );
 
-        ctx.worker_txs[0].send(RetrievalMessage::Done).await.unwrap();
+        ctx.worker_txs[0]
+            .send(RetrievalMessage::Done)
+            .await
+            .unwrap();
         worker.wait().await.unwrap();
     }
 
     #[tokio::test]
-    async fn process_response_batch_preserves_metadata_when_worker_fails_after_extraction() {
+    async fn process_response_batch_returns_metadata_before_forward_failure_then_fails_on_dead_worker()
+     {
         let (worker_tx, worker_rx) = mpsc::channel(1);
         let (processed_tx, processed_rx) = mpsc::channel(1);
         drop(processed_rx);
@@ -493,6 +503,45 @@ mod tests {
             br#"{"pit_id":"pit-after-failure","hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"1","sort":[9,"z"],"_source":{"message":"z"}}]}}"#,
         );
 
+        // The reply arrives before the worker forwards the output buffer, so
+        // the first batch succeeds even though the forward is doomed to fail.
+        let metadata = super::process_response_batch(
+            &ctx,
+            &mut state,
+            response_bytes.clone(),
+            &SearchType::PointInTime,
+            144,
+        )
+        .await
+        .expect("metadata reply must precede the forward failure");
+
+        assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-after-failure"));
+        assert_eq!(
+            metadata.last_sort_raw.as_deref(),
+            Some(br#"[9,"z"]"#.as_slice())
+        );
+        assert_eq!(metadata.doc_count, 1);
+        assert!(!metadata.hits_are_empty);
+
+        assert_eq!(state.retrieved_hits, 1);
+        assert_eq!(
+            ctx.retrieved_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            ctx.retrieved_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            144
+        );
+        assert_eq!(input_bar.position(), 1);
+
+        // The forward failure kills the worker thread and closes its channel.
+        let worker_error = worker.wait().await.unwrap_err().to_string();
+        assert!(worker_error.contains("Failed to send processed batch"));
+
+        // The next dispatch to the dead worker fails fast with locally
+        // recovered fallback metadata instead of hanging.
         let failure = super::process_response_batch(
             &ctx,
             &mut state,
@@ -503,31 +552,29 @@ mod tests {
         .await
         .unwrap_err();
 
-        let metadata = failure.metadata().expect("metadata should survive failure");
+        let metadata = failure
+            .metadata()
+            .expect("metadata should be recovered locally");
         assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-after-failure"));
-        assert_eq!(metadata.last_sort_raw.as_deref(), Some(br#"[9,"z"]"#.as_slice()));
-        assert_eq!(metadata.doc_count, 1);
-        assert!(!metadata.hits_are_empty);
-        assert!(failure
-            .into_error()
-            .to_string()
-            .contains("Failed to send processed batch"));
+        assert!(
+            failure
+                .into_error()
+                .to_string()
+                .contains("Failed to send batch to worker")
+        );
 
-        assert_eq!(state.retrieved_hits, 0);
+        // The failed dispatch must not advance any counters.
+        assert_eq!(state.retrieved_hits, 1);
         assert_eq!(
             ctx.retrieved_count
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0
+            1
         );
         assert_eq!(
             ctx.retrieved_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0
+            144
         );
-        assert_eq!(input_bar.position(), 0);
-
-        let worker_error = worker.wait().await.unwrap_err().to_string();
-        assert!(worker_error.contains("Failed to send processed batch"));
     }
 
     #[tokio::test]
@@ -551,7 +598,9 @@ mod tests {
         .await
         .unwrap_err();
 
-        let metadata = failure.metadata().expect("metadata should be recovered locally");
+        let metadata = failure
+            .metadata()
+            .expect("metadata should be recovered locally");
         assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-send-failed"));
         assert_eq!(
             metadata.last_sort_raw.as_deref(),
@@ -559,10 +608,12 @@ mod tests {
         );
         assert_eq!(metadata.doc_count, 1);
         assert!(!metadata.hits_are_empty);
-        assert!(failure
-            .into_error()
-            .to_string()
-            .contains("Failed to send batch to worker"));
+        assert!(
+            failure
+                .into_error()
+                .to_string()
+                .contains("Failed to send batch to worker")
+        );
 
         assert_eq!(state.retrieved_hits, 0);
         assert_eq!(

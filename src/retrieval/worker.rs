@@ -142,28 +142,21 @@ pub(crate) fn run_worker_loop(
                         }
                     };
 
-                let metadata = extracted.metadata;
-                let processed = extracted.output;
+                // Reply with the metadata before forwarding the output buffer
+                // so pagination is never gated on sink backpressure. If the
+                // forward fails the worker exits with an error; its closed
+                // channel makes the next dispatch to it fail fast.
+                let _ = job.reply_tx.send(Ok(extracted.metadata));
 
-                if let Err(error) = forward_processed_batch(
+                forward_processed_batch(
                     id,
-                    processed,
+                    extracted.output,
                     &processed_tx,
                     &processed_count,
                     &processed_bytes,
                     output_bar.as_ref(),
                     start_time,
-                ) {
-                    let _ = job
-                        .reply_tx
-                        .send(Err(BatchProcessingFailure::with_metadata(
-                            anyhow!(error.to_string()),
-                            metadata,
-                        )));
-                    return Err(error);
-                }
-
-                let _ = job.reply_tx.send(Ok(metadata));
+                )?;
             }
             RetrievalMessage::Done => break,
         }
@@ -185,9 +178,9 @@ fn forward_processed_batch(
     let bytes_count = processed.buffer.len() as u64;
 
     if doc_count > 0 {
-        processed_tx.blocking_send(processed).map_err(|error| {
-            anyhow!("Worker {}: Failed to send processed batch: {}", id, error)
-        })?;
+        processed_tx
+            .blocking_send(processed)
+            .map_err(|error| anyhow!("Worker {}: Failed to send processed batch: {}", id, error))?;
 
         processed_count.fetch_add(doc_count, Ordering::Relaxed);
         processed_bytes.fetch_add(bytes_count, Ordering::Relaxed);
@@ -268,7 +261,10 @@ mod tests {
 
         let metadata = reply_rx.await.unwrap().unwrap();
         assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-next"));
-        assert_eq!(metadata.last_sort_raw.as_deref(), Some(br#"[1,"a"]"#.as_slice()));
+        assert_eq!(
+            metadata.last_sort_raw.as_deref(),
+            Some(br#"[1,"a"]"#.as_slice())
+        );
 
         let processed = processed_rx.recv().await.unwrap();
         assert_eq!(processed.doc_count, 1);
@@ -281,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_worker_loop_ignores_dropped_metadata_receiver_after_forwarding_output() {
+    async fn run_worker_loop_ignores_dropped_metadata_receiver_and_keeps_forwarding_output() {
         let (tx, rx) = mpsc::channel(4);
         let (processed_tx, mut processed_rx) = mpsc::channel(4);
 
@@ -323,7 +319,10 @@ mod tests {
 
         let metadata = reply_rx.await.unwrap().unwrap();
         assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-second"));
-        assert_eq!(metadata.last_sort_raw.as_deref(), Some(br#"[2,"b"]"#.as_slice()));
+        assert_eq!(
+            metadata.last_sort_raw.as_deref(),
+            Some(br#"[2,"b"]"#.as_slice())
+        );
 
         let first_processed = processed_rx.recv().await.unwrap();
         assert_eq!(first_processed.doc_count, 1);
@@ -419,7 +418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_worker_loop_preserves_metadata_when_output_forwarding_fails() {
+    async fn run_worker_loop_replies_metadata_before_forwarding_and_errors_on_forward_failure() {
         let (tx, rx) = mpsc::channel(1);
         let (processed_tx, processed_rx) = mpsc::channel(1);
         drop(processed_rx);
@@ -446,15 +445,18 @@ mod tests {
         .await
         .unwrap();
 
-        let failure = reply_rx.await.unwrap().unwrap_err();
-        let metadata = failure.metadata().expect("metadata should survive failure");
+        // The metadata reply is sent before the output buffer is forwarded, so
+        // pagination is not gated on sink backpressure or sink failure.
+        let metadata = reply_rx
+            .await
+            .unwrap()
+            .expect("reply must carry Ok(metadata) despite the forward failure");
         assert_eq!(metadata.next_pit_id.as_deref(), Some("pit-forward-failed"));
-        assert_eq!(metadata.last_sort_raw.as_deref(), Some(br#"[5,"q"]"#.as_slice()));
+        assert_eq!(
+            metadata.last_sort_raw.as_deref(),
+            Some(br#"[5,"q"]"#.as_slice())
+        );
         assert_eq!(metadata.doc_count, 1);
-        assert!(failure
-            .into_error()
-            .to_string()
-            .contains("Failed to send processed batch"));
 
         let worker_error = handle.wait().await.unwrap_err().to_string();
         assert!(worker_error.contains("Failed to send processed batch"));
