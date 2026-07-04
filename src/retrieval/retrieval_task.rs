@@ -272,7 +272,12 @@ mod tests {
                 Url::parse("http://localhost:9200/").unwrap(),
                 None,
                 None,
-                false,
+                &crate::elasticsearch::ClientOptions {
+                    compression: false,
+                    request_timeout_secs: 0,
+                    insecure: false,
+                    ca_file: None,
+                },
             )
             .unwrap(),
             index: Arc::<str>::from("test-index"),

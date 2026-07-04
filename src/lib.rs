@@ -6,7 +6,7 @@ pub mod retrieval;
 pub async fn run() -> anyhow::Result<()> {
     use clap::Parser;
 
-    let args = cli::Cli::parse();
+    let mut args = cli::Cli::parse();
 
     // Configure logger based on debug flag
     if args.debug {
@@ -16,6 +16,15 @@ pub async fn run() -> anyhow::Result<()> {
         log::debug!("Debug logging enabled");
     } else {
         env_logger::init();
+    }
+
+    // Normalize slices=1 (Elasticsearch rejects slice.max=1) to an unsliced dump.
+    // Placed after logger init so the warning is actually emitted.
+    if args.slices == 1 {
+        log::warn!(
+            "--slices 1 is equivalent to an unsliced dump (Elasticsearch rejects slice.max=1); running unsliced"
+        );
+        args.slices = 0;
     }
 
     // Enable colors if not in quiet mode
@@ -34,8 +43,12 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     // Set up Elasticsearch client
-    let client =
-        elasticsearch::create_client(host_url, auth_username, auth_password, args.es_compress)?;
+    let client = elasticsearch::create_client(
+        host_url,
+        auth_username,
+        auth_password,
+        &elasticsearch::ClientOptions::from_cli(&args),
+    )?;
 
     // Perform the data dump
     retrieval::dump_data(&client, &index, args).await

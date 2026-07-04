@@ -30,7 +30,7 @@ pub struct Cli {
     pub r#type: DumpType,
 
     /// Number of documents to scroll per batch
-    #[clap(long, default_value = "10000")]
+    #[clap(long, default_value = "10000", value_parser = parse_non_zero_usize)]
     pub limit: usize,
 
     /// Optional JSON query string or @/path/to/file.json to filter documents
@@ -84,6 +84,27 @@ pub struct Cli {
     /// Enable Elasticsearch response compression (default: disabled)
     #[clap(long("esCompress"))]
     pub es_compress: bool,
+
+    /// Request timeout in seconds for each Elasticsearch HTTP request (0 disables the timeout)
+    #[clap(long("requestTimeout"), default_value_t = 0)]
+    pub request_timeout_secs: u64,
+
+    /// Skip TLS certificate verification (DANGEROUS: allows man-in-the-middle; only for trusted networks)
+    #[clap(long, conflicts_with = "ca_file")]
+    pub insecure: bool,
+
+    /// Path to a PEM CA certificate bundle used to verify the Elasticsearch server certificate
+    #[clap(long("caFile"))]
+    pub ca_file: Option<String>,
+
+    /// Retry attempts for retry-safe Elasticsearch requests (0 disables retries).
+    /// PIT requests are always retry-safe; scroll continuations are only retried on HTTP 429.
+    #[clap(long("retryAttempts"), default_value_t = 3)]
+    pub retry_attempts: usize,
+
+    /// Base delay between retries in milliseconds (doubles per attempt, capped at 30s)
+    #[clap(long("retryDelay"), default_value_t = 1000)]
+    pub retry_delay_ms: u64,
 }
 
 fn parse_non_zero_usize(value: &str) -> Result<usize, String> {
@@ -116,6 +137,21 @@ mod tests {
         ]);
 
         assert!(result.is_err(), "workers=0 should be rejected");
+    }
+
+    #[test]
+    fn rejects_zero_limit() {
+        let result = Cli::try_parse_from([
+            "elasticdump-rs",
+            "--input",
+            "http://localhost:9200/test_index",
+            "--output",
+            "$",
+            "--limit",
+            "0",
+        ]);
+
+        assert!(result.is_err(), "limit=0 should be rejected");
     }
 
     #[test]
