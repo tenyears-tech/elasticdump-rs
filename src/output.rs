@@ -140,14 +140,24 @@ impl OutputTarget {
                 let commit_result = if overwrite {
                     tokio_fs::rename(&staging_path, &final_path)
                         .await
-                        .map_err(anyhow::Error::from)
+                        .with_context(|| {
+                            format!(
+                                "Failed to move staged output '{}' into place at '{}'",
+                                staging_path.display(),
+                                final_path.display()
+                            )
+                        })
                 } else {
                     // Race-free commit: hard_link fails atomically if the
                     // destination was created after our start-of-run check.
                     match tokio_fs::hard_link(&staging_path, &final_path).await {
-                        Ok(()) => tokio_fs::remove_file(&staging_path)
-                            .await
-                            .map_err(anyhow::Error::from),
+                        Ok(()) => tokio_fs::remove_file(&staging_path).await.with_context(|| {
+                            format!(
+                                "Failed to remove staged output '{}' after linking it into place at '{}'",
+                                staging_path.display(),
+                                final_path.display()
+                            )
+                        }),
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
                             "Output file '{}' was created while the dump was running. Use --overwrite to replace it.",
                             final_path.display()
@@ -156,9 +166,13 @@ impl OutputTarget {
                             log::debug!(
                                 "hard_link commit unsupported ({e}); falling back to rename"
                             );
-                            tokio_fs::rename(&staging_path, &final_path)
-                                .await
-                                .map_err(anyhow::Error::from)
+                            tokio_fs::rename(&staging_path, &final_path).await.with_context(|| {
+                                format!(
+                                    "Failed to move staged output '{}' into place at '{}'",
+                                    staging_path.display(),
+                                    final_path.display()
+                                )
+                            })
                         }
                     }
                 };

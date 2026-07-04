@@ -83,7 +83,14 @@ pub fn parse_input_url(args: &Cli) -> Result<(Url, String, Option<String>, Optio
         .set_password(None)
         .map_err(|_| anyhow!("Failed to clear password from input URL"))?;
     if let Some(query) = input_url.query() {
-        log::warn!("Ignoring query string in --input URL: {}", query);
+        // Log only the parameter names, never their values: query strings can
+        // carry secrets (signatures, tokens) that must not reach the log.
+        let param_names = query
+            .split('&')
+            .map(|pair| pair.split('=').next().unwrap_or(pair))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::warn!("Ignoring query string parameters in --input URL: {param_names}");
     }
     host_url.set_query(None);
     host_url.set_fragment(None);
@@ -155,16 +162,16 @@ pub fn create_client(
 
     let mut headers = HeaderMap::new();
 
+    if let Some(user) = auth_username.as_deref() {
+        log::info!("Using basic authentication for user: {}", user);
+    }
+
     let basic_auth = match (auth_username.as_deref(), auth_password.as_deref()) {
-        (Some(user), Some(pass)) => {
-            log::info!("Using basic authentication for user: {}", user);
-            Some(format!("{}:{}", user, pass))
-        }
+        (Some(user), Some(pass)) => Some(format!("{}:{}", user, pass)),
         (Some(user), None) => {
             log::warn!(
                 "No password provided for user '{user}'; sending basic auth with an empty password"
             );
-            log::info!("Using basic authentication for user: {}", user);
             Some(format!("{}:", user))
         }
         (None, Some(_)) => {
@@ -226,7 +233,7 @@ mod tests {
     use clap::Parser;
     use url::Url;
 
-    use super::{parse_input_url, redacted_url};
+    use super::{ClientOptions, create_client, parse_input_url, redacted_url};
     use crate::cli::Cli;
 
     fn minimal_cli() -> Cli {
@@ -320,6 +327,24 @@ mod tests {
         assert!(
             !error.contains("secret"),
             "error must not contain the raw password: {error}"
+        );
+    }
+
+    #[test]
+    fn create_client_rejects_password_without_username() {
+        let host_url = Url::parse("http://localhost:9200/").unwrap();
+        let options = ClientOptions {
+            compression: false,
+            request_timeout_secs: 0,
+            insecure: false,
+            ca_file: None,
+        };
+        let error = create_client(host_url, None, Some("secret".into()), &options)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("without a username"),
+            "error must explain a password needs a username: {error}"
         );
     }
 

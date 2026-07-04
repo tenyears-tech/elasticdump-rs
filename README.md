@@ -102,7 +102,7 @@ elasticdump-rs --input http://localhost:9200/my_index --output output.jsonl --re
 --overwrite          Overwrite output file if it exists
 --quiet              Suppress progress display
 --debug              Enable verbose logging
---workers            Number of processing workers, must be >= 1 [default: 4] (clamped to the number of slices)
+--workers            Number of processing workers, must be >= 1 [default: 4] (clamped to the effective slice count (1 when slicing is disabled))
 --slices             Number of parallel slices for Elasticsearch sliced scroll API [default: 0, disabled]
 --bufferSize         Size of internal channel buffers, must be >= 1 [default: 16]
 --esCompress         Enable Elasticsearch response compression (default: disabled)
@@ -118,6 +118,8 @@ elasticdump-rs --input http://localhost:9200/my_index --output output.jsonl --re
 When `--output` points to a file, `elasticdump-rs` now stages writes to a temporary file and only replaces the destination after a successful dump. This prevents `--overwrite` from destroying an existing file when validation or retrieval fails early.
 
 `--input` may point to either the index root URL or a trailing `/_search` URL. Proxy/base-path prefixes are preserved, but other endpoint URLs such as `/my_index/_count` are rejected.
+
+Basic-auth credentials (from the `--input` URL or `--username`/`--password`, with the CLI flags overriding the URL) are now validated instead of silently ignored: a password without a username is a hard error, and a username without a password sends basic auth with an empty password and logs a warning. Previously both of these cases silently proceeded unauthenticated.
 
 When `--searchType pit` is used without an explicit `sort`, `elasticdump-rs` now defaults to `["_shard_doc"]`, which is the recommended fast path for full PIT dumps. If you provide your own `sort`, it is preserved unchanged.
 

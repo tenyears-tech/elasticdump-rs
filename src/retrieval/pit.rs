@@ -85,7 +85,14 @@ impl SharedPitCoordinator {
     }
 
     pub fn acquire(&self) -> PitLease {
-        let state = self.inner.lock().unwrap();
+        // Recover a poisoned lock instead of propagating the panic: `abort`
+        // runs from a Drop guard during unwind, where re-panicking on a poisoned
+        // mutex would double-panic into a process abort. `PitState` is plain
+        // data, so continuing with the recovered guard is safe here.
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         PitLease {
             generation: state.generation,
             id: state.current_id.clone(),
@@ -103,7 +110,10 @@ impl SharedPitCoordinator {
 
             let notified = self.notify.notified();
             let maybe_lease = {
-                let state = self.inner.lock().unwrap();
+                let state = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(error) = &state.aborted {
                     return Err(anyhow!(error.clone()));
                 }
@@ -139,7 +149,10 @@ impl SharedPitCoordinator {
             return Err(anyhow::Error::new(DumpCancelled));
         }
 
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(error) = &state.aborted {
             return Err(anyhow!(error.clone()));
         }
@@ -179,7 +192,10 @@ impl SharedPitCoordinator {
     }
 
     pub fn abort(&self, error: String) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.aborted.is_none() {
             state.aborted = Some(error);
             self.notify.notify_waiters();
@@ -190,12 +206,19 @@ impl SharedPitCoordinator {
         let Some(returned_id) = returned_id else {
             return;
         };
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.latest_observed_id = returned_id.to_string();
     }
 
     pub fn latest_id(&self) -> String {
-        self.inner.lock().unwrap().latest_observed_id.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest_observed_id
+            .clone()
     }
 }
 
