@@ -1189,7 +1189,7 @@ setup_runtime() {
   if [[ -n "${BENCH_INDEX_NAME}" ]]; then
     BENCH_INDEX="${BENCH_INDEX_NAME}"
   else
-    BENCH_INDEX="${BENCH_INDEX_PREFIX}_$(date -u +%Y%m%dt%H%M%sz)_$$"
+    BENCH_INDEX="${BENCH_INDEX_PREFIX}_$(date -u +%Y%m%dt%H%M%Sz)_$$"
   fi
 
   validate_index_name "${BENCH_INDEX}"

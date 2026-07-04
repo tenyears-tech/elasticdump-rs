@@ -2,8 +2,11 @@
 name = "elasticdump-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "High-performance Elasticsearch data dumper"
-authors = ["elasticdump-rs"]
+authors = ["TenYears <opensource@tenyears.tech>"]
+license = "MIT"
+repository = "https://github.com/tenyears-tech/elasticdump-rs"
 
 [lib]
 name = "elasticdump_rs"
@@ -14,8 +17,20 @@ name = "elasticdump-rs"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-elasticsearch = { version = "8.17.0-alpha.1", features = [
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-std",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+# The official client has never shipped a non-alpha release on crates.io
+# (all 26 published versions are `-alpha.1` as of 2026-07), so an alpha pin
+# is unavoidable; track the newest 8.x line for ES 7.x/8.x servers.
+elasticsearch = { version = "8.19.0-alpha.1", features = [
     "rustls-tls",
 ], default-features = false }
 clap = { version = "4.4", features = ["derive"] }
@@ -30,12 +45,20 @@ base64 = "0.22"
 http = "1.3"
 bytesize = "2.0"
 console = "0.15"
+tokio-util = "0.7"
+percent-encoding = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 serde_json = "1.0"
 lipsum = "0.9"
+tempfile = "3"
 
 [features]
 large_scale_test = []
 manual_test = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

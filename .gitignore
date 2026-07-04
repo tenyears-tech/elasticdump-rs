@@ -19,3 +19,7 @@
 *.jsonl
 out/
 tmp/
+
+# Local agent workspaces
+/.worktrees/
+/.agent/
