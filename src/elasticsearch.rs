@@ -20,11 +20,18 @@ fn path_segments_without_empty(url: &Url) -> Vec<&str> {
 }
 
 /// Percent-decode a URL component (credentials or index name) into its literal value.
-fn decode_component(raw: &str, what: &str) -> Result<String> {
+/// With `redact` the raw value is kept out of the error message (use for passwords).
+fn decode_component(raw: &str, what: &str, redact: bool) -> Result<String> {
     percent_decode_str(raw)
         .decode_utf8()
         .map(|decoded| decoded.into_owned())
-        .map_err(|err| anyhow!("Failed to percent-decode {what} '{raw}': {err}"))
+        .map_err(|err| {
+            if redact {
+                anyhow!("Failed to percent-decode {what}: {err}")
+            } else {
+                anyhow!("Failed to percent-decode {what} '{raw}': {err}")
+            }
+        })
 }
 
 /// Render a URL for logging with its password masked (the username is preserved).
@@ -60,12 +67,13 @@ pub fn parse_input_url(args: &Cli) -> Result<(Url, String, Option<String>, Optio
     let index = normalized_segments
         .last()
         .ok_or_else(|| anyhow!("No index specified in the input URL path"))?;
+    // Decode before the guard so encoded forms like %5Fsearch cannot bypass it.
+    let index = decode_component(index, "index name", false)?;
     if index.starts_with('_') {
         return Err(anyhow!(
             "Input URL must point to an index root, not an Elasticsearch API endpoint"
         ));
     }
-    let index = decode_component(index, "index name")?;
 
     let mut host_url = input_url.clone();
     host_url
@@ -98,10 +106,10 @@ pub fn parse_input_url(args: &Cli) -> Result<(Url, String, Option<String>, Optio
     let decoded_url_username = if url_username.is_empty() {
         None
     } else {
-        Some(decode_component(url_username, "URL username")?)
+        Some(decode_component(url_username, "URL username", false)?)
     };
     let decoded_url_password = match input_url.password() {
-        Some(password) => Some(decode_component(password, "URL password")?),
+        Some(password) => Some(decode_component(password, "URL password", true)?),
         None => None,
     };
 
@@ -298,5 +306,32 @@ mod tests {
         let url = Url::parse("http://u:secret@localhost:9200/idx").unwrap();
         assert!(!redacted_url(&url).contains("secret"));
         assert!(redacted_url(&url).contains("u:***@"));
+    }
+
+    #[test]
+    fn parse_input_url_password_decode_error_does_not_leak_password() {
+        // %FF percent-decodes to a lone 0xFF byte, which is invalid UTF-8.
+        let args = Cli {
+            input: "http://u:secret%FF@localhost:9200/idx".into(),
+            output: "$".into(),
+            ..minimal_cli()
+        };
+        let error = parse_input_url(&args).unwrap_err().to_string();
+        assert!(
+            !error.contains("secret"),
+            "error must not contain the raw password: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_input_url_rejects_percent_encoded_api_endpoint() {
+        // %5F decodes to '_'; the API-endpoint guard must see the decoded segment.
+        let args = Cli {
+            input: "http://localhost:9200/%5Fsearch".into(),
+            output: "$".into(),
+            ..minimal_cli()
+        };
+        let error = parse_input_url(&args).unwrap_err().to_string();
+        assert!(error.contains("index root"));
     }
 }
