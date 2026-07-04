@@ -44,6 +44,7 @@ RS_BIN=""
 declare -a ELASTICDUMP_CMD=()
 declare -a BENCH_SEARCH_TYPE_LIST=()
 declare -a BENCH_VARIANTS=()
+declare -a CPU_LIMIT_WRAPPER=()
 
 log() {
   printf '[bench] %s\n' "$*"
@@ -756,6 +757,28 @@ resolve_rs_binary() {
   RS_BIN="${REPO_ROOT}/target/release/elasticdump-rs"
 }
 
+resolve_cpu_limit_wrapper() {
+  local platform
+
+  CPU_LIMIT_WRAPPER=()
+  [[ -n "${BENCH_CPU_CORES}" ]] || return 0
+
+  platform="$(cpu_limit_platform)"
+  if [[ "${platform}" == "linux" ]]; then
+    require_command taskset
+    if (( BENCH_CPU_CORES == 1 )); then
+      CPU_LIMIT_WRAPPER=(taskset -c 0)
+    else
+      CPU_LIMIT_WRAPPER=(taskset -c "0-$((BENCH_CPU_CORES - 1))")
+    fi
+  else
+    command -v cpulimit >/dev/null 2>&1 \
+      || die "Missing required command: cpulimit (install with: brew install cpulimit)"
+    CPU_LIMIT_WRAPPER=(cpulimit "--limit=$((BENCH_CPU_CORES * 100))" --include-children --)
+    log "macOS CPU limit uses cpulimit duty-cycling (aggregate ${BENCH_CPU_CORES}00% cap, not core pinning); wall-clock results are indicative"
+  fi
+}
+
 count_file_lines() {
   local file_path="$1"
   local line_count
@@ -780,7 +803,8 @@ run_timed_command() {
   local metrics_file="$1"
 
   shift
-  /usr/bin/time -p sh -c 'exec "$@" 2>&3' sh "$@" 3>&2 2>"${metrics_file}"
+  /usr/bin/time -p sh -c 'exec "$@" 2>&3' sh \
+    ${CPU_LIMIT_WRAPPER[@]+"${CPU_LIMIT_WRAPPER[@]}"} "$@" 3>&2 2>"${metrics_file}"
 }
 
 read_timing_metrics() {
@@ -1283,6 +1307,7 @@ main() {
   require_command mktemp
   require_command /usr/bin/time
   resolve_python
+  resolve_cpu_limit_wrapper
   setup_runtime
   trap cleanup EXIT
 
