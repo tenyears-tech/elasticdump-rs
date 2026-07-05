@@ -176,6 +176,34 @@ This tool is inspired by the Node.js [elasticdump](https://github.com/elasticsea
 
 `elasticdump-rs` is optimized for high throughput and low memory usage, making it suitable for dumping large indices. Performance varies with your network, Elasticsearch cluster, and local machine. Raise `--slices` to parallelize retrieval (see the `--workers` note above), and consider a `target-cpu=native` release build.
 
+### Benchmark results
+
+The maintainer benchmark (`scripts/benchmark/compare-with-elasticdump.sh`) exports a full index to JSONL with both `elasticdump-rs` and the original Node.js `elasticdump`, using each tool's Scroll and PIT modes. Setup: **2,000,000** synthetic log documents (an analyzed ~256-byte `message` plus typical keyword/date/integer fields), Elasticsearch 7.17, index of 2 primary shards / 0 replicas, force-merged to a single segment with the default codec (modelling a static, read-optimized dump target). Host: 32-core x86-64 Linux; each timed run is pinned to *N* CPU cores with `taskset`. Figures are the mean of 2 measured runs after 1 warmup, and throughput is wall-clock (documents ÷ elapsed time).
+
+Throughput (higher is better):
+
+| Export mode | 1 CPU core | 4 CPU cores |
+|---|---|---|
+| **elasticdump-rs**, scroll | 375,587 docs/s · 252.3 MiB/s | 339,271 docs/s · 227.9 MiB/s |
+| **elasticdump-rs**, PIT | 390,625 docs/s · 269.5 MiB/s | 343,938 docs/s · 237.3 MiB/s |
+| elasticdump (Node.js), scroll | 190,749 docs/s · 127.8 MiB/s | 212,314 docs/s · 142.2 MiB/s |
+| elasticdump (Node.js), PIT | 191,663 docs/s · 128.4 MiB/s | 210,970 docs/s · 141.3 MiB/s |
+
+Speedup of `elasticdump-rs` over `elasticdump`:
+
+| Metric | 1 CPU core | 4 CPU cores |
+|---|---|---|
+| Wall-clock, scroll | **1.97× faster** | **1.60× faster** |
+| Wall-clock, PIT | **2.04× faster** | **1.63× faster** |
+| CPU time consumed, scroll | 5.1× less | 5.3× less |
+| CPU time consumed, PIT | 4.4× less | 4.2× less |
+
+Notes:
+
+- **`elasticdump-rs` is bound by Elasticsearch, not the CPU here.** It spends only ~2 s of CPU on a ~5 s dump, so extra cores do not raise its throughput — the small differences between the 1- and 4-core columns are Elasticsearch-side run-to-run variance, not core scaling. Its ~4–5× lower CPU cost leaves the machine free for other work.
+- **`elasticdump` is CPU-bound.** It needs ~10 s of CPU per dump; pinned to a single core it serialises to ~191k docs/s, and only recovers to ~211k docs/s once it can spread across more cores.
+- Absolute numbers depend heavily on your Elasticsearch cluster, network, disk, and page-cache state. Treat the ratios as the portable result and re-run the script in your own environment.
+
 ## Testing
 
 The project includes both unit tests and integration tests:
