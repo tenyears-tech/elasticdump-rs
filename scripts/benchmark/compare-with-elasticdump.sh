@@ -17,7 +17,7 @@ set -euo pipefail
 # authoritative.
 
 ES_URL="${ES_URL:-http://localhost:9200}"
-BENCH_DOCS="${BENCH_DOCS:-1000000}"
+BENCH_DOCS="${BENCH_DOCS:-2000000}"
 BENCH_BULK_SIZE="${BENCH_BULK_SIZE:-5000}"
 BENCH_LIMIT="${BENCH_LIMIT:-10000}"
 BENCH_TEXT_BYTES="${BENCH_TEXT_BYTES:-256}"
@@ -390,7 +390,7 @@ import sys
 codec = sys.argv[1]
 
 index_settings = {
-    "number_of_shards": 1,
+    "number_of_shards": 2,
     "number_of_replicas": 0,
     "refresh_interval": "-1",
 }
