@@ -204,8 +204,8 @@ Speedup of `elasticdump-rs` over `elasticdump`:
 
 Notes:
 
-- **The unsliced `elasticdump-rs` run is bound by Elasticsearch round-trips, not the CPU.** It spends only ~2 s of CPU on a ~5 s dump driving a single sequential cursor, so extra cores do not raise throughput *in this mode* — the small differences between the 1- and 4-core columns are run-to-run variance. Slicing (below) is what engages more cores. The ~4–5× lower CPU cost leaves the machine free for other work either way.
-- **`elasticdump` is CPU-bound.** It needs ~10 s of CPU per dump; pinned to a single core it serialises to ~191k docs/s, and only recovers to ~211k docs/s once it can spread across more cores.
+- **The unsliced `elasticdump-rs` run is bound by Elasticsearch round-trips, not the CPU.** It spends only \~2 s of CPU on a \~5 s dump driving a single sequential cursor, so extra cores do not raise throughput *in this mode* — the small differences between the 1- and 4-core columns are run-to-run variance. Slicing (below) is what engages more cores. The \~4–5× lower CPU cost leaves the machine free for other work either way.
+- **`elasticdump` is CPU-bound.** It needs ~10 s of CPU per dump; pinned to a single core it serialises to \~191k docs/s, and only recovers to \~211k docs/s once it can spread across more cores.
 
 #### Sliced retrieval (`--slices`)
 
