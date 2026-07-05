@@ -808,6 +808,36 @@ count_file_bytes() {
   printf '%s\n' "${byte_count}"
 }
 
+format_throughput() {
+  local docs="$1"
+  local bytes="$2"
+  local seconds="$3"
+
+  "${PYTHON_BIN}" - "${docs}" "${bytes}" "${seconds}" <<'PY'
+import sys
+
+docs = float(sys.argv[1])
+byte_count = float(sys.argv[2])
+seconds = float(sys.argv[3])
+
+if seconds <= 0:
+    print("n/a docs/sec, n/a/sec")
+    raise SystemExit(0)
+
+docs_per_sec = docs / seconds
+bytes_per_sec = byte_count / seconds
+
+units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+index = 0
+rate = bytes_per_sec
+while rate >= 1024 and index < len(units) - 1:
+    rate /= 1024
+    index += 1
+
+print(f"{docs_per_sec:.0f} docs/sec, {rate:.1f} {units[index]}/sec")
+PY
+}
+
 run_timed_command() {
   local metrics_file="$1"
 
@@ -903,8 +933,10 @@ log_run_metrics() {
   local cpu_seconds="$8"
   local line_count="$9"
   local byte_count="${10}"
+  local throughput
 
-  log "${phase} ${run_number}/${run_total} ${tool_name}: wall ${real_seconds}s | cpu ${cpu_seconds}s (user ${user_seconds}s + sys ${sys_seconds}s), ${line_count} lines, ${byte_count} bytes"
+  throughput="$(format_throughput "${line_count}" "${byte_count}" "${real_seconds}")"
+  log "${phase} ${run_number}/${run_total} ${tool_name}: wall ${real_seconds}s | cpu ${cpu_seconds}s (user ${user_seconds}s + sys ${sys_seconds}s), ${line_count} lines, ${byte_count} bytes, ${throughput}"
 }
 
 build_benchmark_variants() {
@@ -1104,6 +1136,21 @@ expected_runs = int(sys.argv[2])
 tools = []
 rows_by_tool = {}
 
+
+def format_throughput(docs, byte_count, seconds):
+    if seconds <= 0:
+        return "n/a docs/sec, n/a/sec"
+    docs_per_sec = docs / seconds
+    bytes_per_sec = byte_count / seconds
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    index = 0
+    rate = bytes_per_sec
+    while rate >= 1024 and index < len(units) - 1:
+        rate /= 1024
+        index += 1
+    return f"{docs_per_sec:.0f} docs/sec, {rate:.1f} {units[index]}/sec"
+
+
 with open(results_file, "r", encoding="utf-8", newline="") as handle:
     reader = csv.DictReader(handle, delimiter="\t")
     expected_fields = [
@@ -1152,7 +1199,8 @@ for tool in tools:
             f"wall {row['real_seconds']:.2f}s | "
             f"cpu {row['cpu_seconds']:.2f}s "
             f"(user {row['user_seconds']:.2f}s + sys {row['sys_seconds']:.2f}s), "
-            f"{row['lines']} lines, {row['bytes']} bytes"
+            f"{row['lines']} lines, {row['bytes']} bytes, "
+            f"{format_throughput(row['lines'], row['bytes'], row['real_seconds'])}"
         )
 
 print("Averages")
@@ -1185,7 +1233,8 @@ for tool in tools:
         f"wall {display_seconds_text(avg['real_seconds'])}s avg | "
         f"cpu {avg['display_cpu_seconds']}s avg "
         f"(user {avg['display_user_seconds']}s; sys {avg['display_sys_seconds']}s), "
-        f"{avg['lines']} lines avg, {avg['bytes']} bytes avg"
+        f"{avg['lines']} lines avg, {avg['bytes']} bytes avg, "
+        f"{format_throughput(avg['lines'], avg['bytes'], avg['real_seconds'])} avg"
     )
 
 def print_comparison(label, lhs, rhs):
