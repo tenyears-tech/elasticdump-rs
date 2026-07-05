@@ -37,6 +37,8 @@ BENCH_WORKDIR="${BENCH_WORKDIR:-}"
 BENCH_RS_BIN="${BENCH_RS_BIN:-}"
 BENCH_ELASTICDUMP_CMD="${BENCH_ELASTICDUMP_CMD:-elasticdump}"
 BENCH_CPU_CORES="${BENCH_CPU_CORES:-}"
+BENCH_RS_SLICES="${BENCH_RS_SLICES:-}"
+BENCH_RS_WORKERS="${BENCH_RS_WORKERS:-}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -90,6 +92,13 @@ Options:
   --cpu-cores N               Limit each timed tool run to N CPU cores
                               (Linux: taskset affinity; macOS: cpulimit
                               duty-cycle cap; empty = unlimited)
+  --rs-slices N               Pass --slices N to elasticdump-rs runs
+                              (0 or empty = unsliced; N >= 2 enables sliced
+                              retrieval and suffixes rs variant labels with
+                              -sN; Elasticsearch rejects slice.max=1)
+  --rs-workers N              Pass --workers N to elasticdump-rs runs
+                              (empty = match --rs-slices when sliced,
+                              otherwise the tool default)
   --help                      Show this help text
 
 Environment variables with the same names are also supported.
@@ -202,6 +211,16 @@ parse_args() {
       --cpu-cores)
         require_option_value "$@"
         BENCH_CPU_CORES="$2"
+        shift 2
+        ;;
+      --rs-slices)
+        require_option_value "$@"
+        BENCH_RS_SLICES="$2"
+        shift 2
+        ;;
+      --rs-workers)
+        require_option_value "$@"
+        BENCH_RS_WORKERS="$2"
         shift 2
         ;;
       --help)
@@ -376,6 +395,22 @@ validate_config() {
     available_cores="$(available_cpu_cores "${cpu_limit_platform_name}")"
     (( BENCH_CPU_CORES <= available_cores )) || die "BENCH_CPU_CORES must not exceed available CPU cores (${available_cores}), got: ${BENCH_CPU_CORES}"
   fi
+
+  if [[ -n "${BENCH_RS_SLICES}" ]]; then
+    validate_uint "BENCH_RS_SLICES" "${BENCH_RS_SLICES}"
+    (( BENCH_RS_SLICES != 1 )) \
+      || die "BENCH_RS_SLICES must be 0 (unsliced) or >= 2 (Elasticsearch rejects slice.max=1)"
+  fi
+  if [[ -n "${BENCH_RS_WORKERS}" ]]; then
+    validate_uint "BENCH_RS_WORKERS" "${BENCH_RS_WORKERS}"
+    (( BENCH_RS_WORKERS > 0 )) || die "BENCH_RS_WORKERS must be greater than zero"
+  fi
+}
+
+# Sliced retrieval is engaged only for an explicit slice count >= 2; 0 or
+# empty keeps the historical unsliced invocation (the tool's own default).
+rs_slices_enabled() {
+  [[ -n "${BENCH_RS_SLICES}" ]] && (( BENCH_RS_SLICES >= 2 ))
 }
 
 resolve_python() {
@@ -956,6 +991,20 @@ variant_label() {
   printf '%s-%s\n' "${tool_name}" "${search_type}"
 }
 
+# rs variants carry an -sN suffix when sliced so run logs, the TSV, and the
+# summary make the sliced configuration explicit (the Node.js elasticdump has
+# no slicing support, so its labels never change).
+rs_variant_label() {
+  local search_type="$1"
+  local label
+
+  label="$(variant_label "elasticdump-rs" "${search_type}")"
+  if rs_slices_enabled; then
+    label="${label}-s${BENCH_RS_SLICES}"
+  fi
+  printf '%s\n' "${label}"
+}
+
 run_one_series_entry() {
   local tool_name="$1"
   local phase="$2"
@@ -1016,11 +1065,21 @@ run_elasticdump_rs_entry() {
   local metrics_file
   local input_url
   local tool_label
+  local -a rs_parallel_args=()
 
   input_url="$(es_url "/${BENCH_INDEX}")"
-  tool_label="$(variant_label "elasticdump-rs" "${search_type}")"
+  tool_label="$(rs_variant_label "${search_type}")"
   output_file="${WORKDIR}/${tool_label}.${phase}.${run_number}.jsonl"
   metrics_file="${WORKDIR}/${tool_label}.${phase}.${run_number}.metrics"
+
+  if rs_slices_enabled; then
+    rs_parallel_args+=(--slices "${BENCH_RS_SLICES}")
+    # The tool clamps workers to min(workers, slices), so default the worker
+    # count to the slice count to keep one extraction worker per slice.
+    rs_parallel_args+=(--workers "${BENCH_RS_WORKERS:-${BENCH_RS_SLICES}}")
+  elif [[ -n "${BENCH_RS_WORKERS}" ]]; then
+    rs_parallel_args+=(--workers "${BENCH_RS_WORKERS}")
+  fi
 
   run_one_series_entry \
     "${tool_label}" \
@@ -1037,6 +1096,7 @@ run_elasticdump_rs_entry() {
     --limit "${BENCH_LIMIT}" \
     --overwrite \
     --quiet \
+    ${rs_parallel_args[@]+"${rs_parallel_args[@]}"} \
     $(if [[ "${search_type}" == "scroll" ]]; then
         printf '%s\n' "--scrollTime" "${BENCH_SCROLL_TIME}" "--searchType" "scroll"
       else
@@ -1126,13 +1186,21 @@ run_benchmark_series() {
 
 print_summary() {
   local results_file="$1"
+  local rs_scroll_tool
+  local rs_pit_tool
 
-  "${PYTHON_BIN}" - "${results_file}" "${BENCH_MEASURED_RUNS}" <<'PY'
+  rs_scroll_tool="$(rs_variant_label "scroll")"
+  rs_pit_tool="$(rs_variant_label "pit")"
+
+  "${PYTHON_BIN}" - "${results_file}" "${BENCH_MEASURED_RUNS}" \
+    "${rs_scroll_tool}" "${rs_pit_tool}" <<'PY'
 import csv
 import sys
 
 results_file = sys.argv[1]
 expected_runs = int(sys.argv[2])
+rs_scroll_tool = sys.argv[3]
+rs_pit_tool = sys.argv[4]
 tools = []
 rows_by_tool = {}
 
@@ -1307,9 +1375,9 @@ def print_comparison(label, lhs, rhs):
     print(wall_summary)
     print(cpu_summary)
 
-print_comparison("Scroll rs vs node", "elasticdump-rs-scroll", "elasticdump-scroll")
-print_comparison("PIT rs vs node", "elasticdump-rs-pit", "elasticdump-pit")
-print_comparison("elasticdump-rs PIT vs Scroll", "elasticdump-rs-pit", "elasticdump-rs-scroll")
+print_comparison("Scroll rs vs node", rs_scroll_tool, "elasticdump-scroll")
+print_comparison("PIT rs vs node", rs_pit_tool, "elasticdump-pit")
+print_comparison("elasticdump-rs PIT vs Scroll", rs_pit_tool, rs_scroll_tool)
 print_comparison("elasticdump PIT vs Scroll", "elasticdump-pit", "elasticdump-scroll")
 PY
 }
@@ -1390,6 +1458,15 @@ main() {
     printf '  CPU_LIMIT_WRAPPER=%s\n' "${CPU_LIMIT_WRAPPER[*]}"
   else
     printf '  BENCH_CPU_CORES=(unlimited)\n'
+  fi
+  if rs_slices_enabled; then
+    printf '  BENCH_RS_SLICES=%s\n' "${BENCH_RS_SLICES}"
+    printf '  BENCH_RS_WORKERS=%s\n' "${BENCH_RS_WORKERS:-${BENCH_RS_SLICES} (matched to slices)}"
+  else
+    printf '  BENCH_RS_SLICES=(unsliced)\n'
+    if [[ -n "${BENCH_RS_WORKERS}" ]]; then
+      printf '  BENCH_RS_WORKERS=%s\n' "${BENCH_RS_WORKERS}"
+    fi
   fi
   printf '  BENCH_INDEX=%s\n' "${BENCH_INDEX}"
   printf '  WORKDIR=%s\n' "${WORKDIR}"
